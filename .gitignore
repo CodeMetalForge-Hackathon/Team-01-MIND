@@ -1,0 +1,14 @@
+# Audio of people — never commit (hackathon rules). Share by USB / shared drive.
+data/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.DS_Store
+
+# rebuilt by python classify.py
+models/
+
+# bundles used to move files around, never commit
+*.zip

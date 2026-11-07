@@ -1,0 +1,20 @@
+# Copied verbatim from the agreed doc (teammate's M0 config). Single source of
+# truth for sensor layout, sample rate, medium and timing. Stage 2 moves the
+# pair to 1.0 m apart: change x_m to -0.5 / 0.5 here and rerun sim.py.
+medium: air                 # air or water
+conditions:
+  temperature_c: 20
+  humidity_pct: 50
+sampling:
+  fs_hz: 10000              # readings per second per sensor
+sensors:
+  - {ch: 0, name: DNL-S1, x_m: -0.25, y_m: 0.0}
+  - {ch: 1, name: DNL-S2, x_m:  0.25, y_m: 0.0}
+bearing:
+  front: left               # which side of the sensor pair sounds come from
+timing:
+  sigma_s: 0.0001           # expected timing error per sensor (100 microseconds)
+geo:
+  lat0: 42.36030            # map origin for ATAK
+  lon0: -71.05880
+  x_axis_bearing_deg: 90    # x points east, y points north

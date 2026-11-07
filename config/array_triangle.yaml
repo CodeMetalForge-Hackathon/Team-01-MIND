@@ -1,0 +1,21 @@
+# Position-mode layout for Stage 3 (3 sensors, 2 m triangle). Same schema as
+# array.yaml. ASSUMED equilateral positions -- replace with the tape-measured
+# ones once the triangle is laid out on the floor.
+medium: air
+conditions:
+  temperature_c: 20
+  humidity_pct: 50
+sampling:
+  fs_hz: 10000
+sensors:
+  - {ch: 0, name: DNL-S1, x_m: 0.0, y_m: 0.0}
+  - {ch: 1, name: DNL-S2, x_m: 2.0, y_m: 0.0}
+  - {ch: 2, name: DNL-S3, x_m: 1.0, y_m: 1.732}
+bearing:
+  front: left
+timing:
+  sigma_s: 0.0001
+geo:
+  lat0: 42.36030
+  lon0: -71.05880
+  x_axis_bearing_deg: 90

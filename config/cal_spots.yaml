@@ -1,0 +1,11 @@
+# Taped spots with known positions (meters, local frame of the array file).
+# P45: Stage 2 test spot, 2 m from the pair midpoint at 45 deg off the axis.
+# T*: Stage 3 calibration spots inside the 2 m triangle (assumed layout).
+direction:
+  P45: {x: 1.414, y: 1.414}
+  P90: {x: 0.0, y: 1.5}
+triangle:
+  T1: {x: 1.0, y: 0.577}
+  T2: {x: 0.6, y: 0.35}
+  T3: {x: 1.4, y: 0.35}
+  T4: {x: 1.0, y: 1.15}

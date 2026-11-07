@@ -1,0 +1,14 @@
+numpy
+scipy
+pandas
+pyyaml
+matplotlib
+plotly
+dash
+scikit-learn
+nbformat
+jupyter
+# optional: librosa (MFCC features degrade gracefully without it)
+ipywidgets   # optional: live sliders in 01_tune_detection
+pyserial     # recording/record.py
+kaleido      # optional: export dashboard figures
