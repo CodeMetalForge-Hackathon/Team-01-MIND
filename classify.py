@@ -46,7 +46,11 @@ def background_bank(fs, rng, n=8):
         a = z["audio"] if "audio" in z else z["samples"][:, 0]
         a = a.astype(float) - np.mean(a)
         bank += [a[i:i + fs] for i in range(0, len(a) - fs, fs)]
-    if not bank:
+    if not bank:   # real background: the 'other' clips cut from recordings (make_clips.py)
+        for p in sorted(glob.glob(str(ROOT / "data/clips/other/*.npz")))[:40]:
+            a = np.load(p)["audio"].astype(float)
+            bank.append(a - a.mean())
+    if not bank:   # last resort only: synthetic noise
         import sim
         bank = [sim.other(rng, fs, n=fs, kind=k) for k in ("pink", "fan", "rumble", "pink", "fan", "rustle")][:n]
     return [b / (np.std(b) + 1e-12) for b in bank]
@@ -187,6 +191,10 @@ def plot_gallery(clips, per_label=4, seed=0):
                              sharey=True)
     for i, lab in enumerate(LABELS):
         sub = clips[clips.label == lab]
+        if not len(sub):
+            for j in range(per_label):
+                axes[i, j].set_title(f"{lab}: no clips yet", fontsize=8, color="#999")
+            continue
         pick = sub.iloc[rng.choice(len(sub), min(per_label, len(sub)), replace=False)]
         for j, r in enumerate(pick.itertuples()):
             f, t, S = spectrogram(r.audio, r.fs, nperseg=256, noverlap=192)
@@ -224,6 +232,12 @@ def plot_scatter(feat, x="duration_s", y="pitch_strength", title=None):
 if __name__ == "__main__":
     clips = load_clips()
     print(f"{len(clips)} clips, sessions {sorted(clips.session.unique())}")
+    counts = clips.label.value_counts().reindex(LABELS, fill_value=0)
+    print("clips per label:", counts.to_dict())
+    thin = [k for k, v in counts.items() if v < 10]
+    if thin:
+        print(f"WARNING: fewer than 10 clips for {thin}. The model cannot learn these labels, and the scores "
+              "below are not meaningful for them. Record more (see make_clips.py).")
     feat = featurize(clips, augment_snrs=(20, 10, 5))
     res = loso_eval(feat)
     for name in ("rules", "model"):
