@@ -12,3 +12,20 @@ models/
 
 # bundles used to move files around, never commit
 *.zip
+# Audio of people and generated models never go into git (hackathon rules).
+data/
+models/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# PlatformIO
+.pio/

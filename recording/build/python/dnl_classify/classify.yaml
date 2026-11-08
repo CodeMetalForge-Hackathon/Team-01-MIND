@@ -1,0 +1,22 @@
+# Thresholds for the rule classifier (same names as laptop/config.yaml "classification").
+# Tune with: python -m dnl_classify.evaluate
+rules:
+  knock_max_rise_ms: 6.0
+  knock_max_dur_ms: 150
+  voice_min_dur_ms: 150
+  voice_max_dur_ms: 2500
+  voice_min_mod_hz: 2.5
+  voice_max_mod_hz: 9.0
+  cough_min_dur_ms: 80
+  cough_max_dur_ms: 700
+  steady_min_dur_ms: 1500
+  steady_max_mod_hz: 1.5
+
+detection:
+  k: 5.0            # trigger at k x noise floor
+  abs_min: 15.0     # counts
+  end_frac: 0.2     # a sound ends when its slow envelope drops below this share of its peak
+
+model:
+  path: models/dnl_rf.joblib   # trained by build+evaluate; rules are used if it is missing
+  min_confidence: 0.45         # below this the model's label is reported as "other"

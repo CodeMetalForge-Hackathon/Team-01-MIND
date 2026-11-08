@@ -4,6 +4,8 @@ Usage:
     python tools/record.py --port /dev/ttyACM0 --seconds 20 --out data/recordings/stage1_knocks.npz
 
 Prints a summary: sample rate, channels, dropped packets (seq gaps), ADC overflows.
+Saves t_start_unix (computer clock time of the first sample) so recordings from two nodes,
+made in two terminals at the same time, can be lined up by plot_recording.py.
 Recordings stay out of git (data/ is in .gitignore).
 """
 
@@ -58,7 +60,7 @@ def main() -> None:
     ap.add_argument("--notes", default="")
     args = ap.parse_args()
 
-    chunks, first_index, fs_hz = [], None, None
+    chunks, first_index, fs_hz, t_start = [], None, None, None
     last_seq, dropped, overflows = None, 0, 0
     with serial.Serial(args.port, 921600, timeout=0.2) as port:
         port.reset_input_buffer()
@@ -67,6 +69,7 @@ def main() -> None:
         for seq, fs, first, ov, samples in read_packets(port):
             if first_index is None:
                 first_index, fs_hz = first, fs
+                t_start = time.time() - samples.shape[0] / fs  # first sample, approx (USB delay ~ms)
             elif seq != (last_seq + 1) % 65536:
                 dropped += (seq - last_seq - 1) % 65536
             last_seq = seq
@@ -78,7 +81,7 @@ def main() -> None:
     data = np.concatenate(chunks)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, samples=data, fs_hz=fs_hz, first_index=first_index,
+    np.savez(out, samples=data, fs_hz=fs_hz, first_index=first_index, t_start_unix=t_start,
              dropped_packets=dropped, adc_overflows=overflows, notes=args.notes)
 
     print(f"Saved {out}: {data.shape[0]} samples x {data.shape[1]} channels at {fs_hz} Hz "
@@ -89,3 +92,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
