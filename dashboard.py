@@ -397,7 +397,7 @@ def geo_figure(src, fixes, contacts, acks, selected, now_s, show_truth, basemap,
     la, lo_ = to_latlon(src, [lo[0], hi[0]], [lo[1], hi[1]])
     span_m = float(max(hi - lo))
     # web-map zoom so the whole area (span_m) fits ~700 px; tiles get blurry past their native ~zoom 19
-    zoom = float(np.clip(np.log2(156543.03 * np.cos(np.radians(la.mean())) * 700 / span_m), 3, 21))
+    zoom = float(np.clip(np.log2(156543.03 * np.cos(np.radians(la.mean())) * 700 / span_m), 3, 19))
     layers = [dict(sourcetype="raster", source=[ESRI_SAT], below="traces")] if basemap == "satellite" else []
     fig.update_layout(map=dict(style="white-bg" if basemap == "satellite" else "open-street-map", layers=layers,
                                center=dict(lat=float(la.mean()), lon=float(lo_.mean())), zoom=zoom),

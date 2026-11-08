@@ -132,17 +132,75 @@ def detect_recording(samples, fs, p: DetectParams, sensors_xy=None, c_mps=344.0)
     else:
         max_lag = 0.005
     det = det.sort_values("t_s").reset_index(drop=True)
-    sid, start, used = 0, None, set()
-    ids = []
-    for _, r in det.iterrows():
-        if start is None or r.t_s - start > max_lag or r.ch in used:
+    # Cluster onsets that sit within one travel-time window of each other, then keep the CLEAREST
+    # onset per channel (highest SNR) as the sound. Stray noise triggers in the same window become
+    # their own one-channel "sounds" (later skipped) instead of splitting the real sound in two.
+    ids = np.zeros(len(det), dtype=int)
+    sid, i, n = 0, 0, len(det)
+    while i < n:
+        j = i + 1
+        while j < n and det.t_s.iat[j] - det.t_s.iat[i] <= max_lag:
+            j += 1
+        block = det.iloc[i:j]
+        sid += 1
+        best = block.sort_values("snr", ascending=False).drop_duplicates("ch").index
+        ids[best] = sid
+        for k in block.index.difference(best):
             sid += 1
-            start, used = r.t_s, set()
-        used.add(r.ch)
-        ids.append(sid)
+            ids[k] = sid
+        i = j
     det["sound_id"] = ids
+    if sensors_xy is not None and n_ch >= 3:
+        det = guided_fill(det, chains, fs, np.asarray(sensors_xy, float), c_mps)
     det["t_s"] = det["t_s"].round(7)
     return det, chains, det.copy()
+
+
+def guided_onset(env, fs, t_center, half_win, k_local=3.0):
+    """Onset of a sound we KNOW happened (other sensors heard it) near t_center, judged against the
+    local background just before the window. Returns (onset_sample, peak) or None."""
+    i0, i1 = int((t_center - half_win) * fs), int((t_center + half_win) * fs)
+    b0 = i0 - int(0.1 * fs)
+    if b0 < 0 or i1 >= len(env) or i1 - i0 < 5:
+        return None
+    bg = float(np.median(env[b0:i0]))
+    seg = env[i0:i1]
+    peak = float(seg.max())
+    if peak < k_local * max(bg, 1e-9):
+        return None
+    s_ = i0 + int(np.argmax(seg > bg + 0.5 * (peak - bg)))
+    low = bg + 0.25 * (env[s_] - bg)
+    j = s_
+    while j > max(s_ - int(0.010 * fs), 1) and env[j - 1] >= low:
+        j -= 1
+    j0 = max(j - 1, 0)
+    d = env[j] - env[j0]
+    frac = float(np.clip((low - env[j0]) / d, 0, 1)) if d > 0 else 0.0
+    return j0 + frac, peak
+
+
+def guided_fill(det, chains, fs, xy, c_mps, margin_s=0.005):
+    """A sound heard clearly on all but one sensor did happen: look for it on the missing sensor
+    (it may have been deaf for a moment after a noise trigger). Same idea as record_plot.py."""
+    n_ch = len(chains)
+    add = []
+    for sid, g in det.groupby("sound_id"):
+        if len(g) != n_ch - 1:
+            continue
+        (m,) = set(range(n_ch)) - set(g.ch)
+        t_mid = float(g.t_s.mean())
+        half = max(np.linalg.norm(xy[m] - xy[int(k)]) for k in g.ch) / c_mps + margin_s
+        hit = guided_onset(chains[m]["env"], fs, t_mid, half)
+        if hit is None:
+            continue
+        on, pk = hit
+        t_on = on / fs
+        if all(abs(t_on - tk) <= np.linalg.norm(xy[m] - xy[int(k)]) / c_mps + margin_s for k, tk in zip(g.ch, g.t_s)):
+            add.append(dict(ch=m, t_s=t_on, sample_index=int(round(on)), peak=int(pk), snr=np.nan, clipped=False,
+                            sound_id=sid, guided=True))
+    if add:
+        det = pd.concat([det, pd.DataFrame(add)], ignore_index=True).sort_values(["sound_id", "ch"]).reset_index(drop=True)
+    return det
 
 
 def to_contract(det):
