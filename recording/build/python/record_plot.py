@@ -15,6 +15,10 @@ Per node it makes one figure with three panels:
   3. ADC vs distance (m) travelled by the sound since it was made (after triangulation),
      with the node's computed distance to the source marked; the knock should line up with it.
 
+Each sound is also classified as knock, thud, cough or speaking ("other" if none fits), using the
+rule classifier in dnl_classify (thresholds in dnl_classify/classify.yaml). The label comes from
+a vote of the nodes that heard it, weighted by how clearly each heard it.
+
 Triangulation (3 nodes): the knock happened at unknown (x, y) at unknown time t0.
 For node i at p_i, heard at t_i:   |(x, y) - p_i| = c * (t_i - t0).
 Three equations, three unknowns, solved by Gauss-Newton least squares.
@@ -66,7 +70,7 @@ def read_packets(port):
             yield node, synced, seq, fs, first_t, ov, samples
 
 
-def record(ports, seconds, out, settle=3.0):
+def record(ports, seconds, out, settle=0.0):
     import serial
     data = {}
     warned = set()
@@ -124,13 +128,11 @@ def record(ports, seconds, out, settle=3.0):
                     d["adc"].append(samples)
 
     threads = [threading.Thread(target=worker, args=(p,), daemon=True) for p in ports]
-    print(f"Waiting {settle:.0f} s for the clocks to sync, then recording {seconds:.0f} s from {', '.join(ports)}.")
+    print(f"Recording {seconds:.0f} s from {', '.join(ports)}.")
     for th in threads:
         th.start()
-    time.sleep(settle)
-    print("RECORDING NOW: stay quiet 2 s, then knock between the nodes...")
     for th in threads:
-        th.join(seconds + 5)
+        th.join(settle + seconds + 5)
 
     seen_ports = {d["port"] for d in data.values()}
     for name in ports:
@@ -171,6 +173,59 @@ def record(ports, seconds, out, settle=3.0):
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, **arrays)
     print(f"saved {out}")
+
+
+# ============================================================ classification
+CLASS_COLORS = {"knock": "tab:red", "thud": "tab:brown", "cough": "tab:purple",
+                "speaking": "tab:green", "other": "0.5"}
+_RULES = None
+
+
+def _rules():
+    global _RULES
+    if _RULES is None:
+        import yaml
+        _RULES = yaml.safe_load((Path(__file__).parent / "dnl_classify" / "classify.yaml").read_text())["rules"]
+    return _RULES
+
+
+def classify_events(d, events):
+    """Add cls / cls_conf / cls_why to each event of one node (skips ones already done)."""
+    from dnl_classify.features import envelopes, event_end, event_features
+    from dnl_classify.rules import classify_sound
+    todo = [e for e in events if "cls" not in e]
+    if not todo:
+        return
+    if "cenv" not in d:
+        d["cenv"], d["cslow"] = envelopes(d["adc"], d["fs"])
+        d["cfloor"] = max(float(np.median(d["cenv"])), 1.0)
+    env, slow, floor, fs = d["cenv"], d["cslow"], d["cfloor"], d["fs"]
+    for e in todo:
+        on = int(np.clip(np.searchsorted(d["t"], e["onset_us"]), 0, len(env) - 2))
+        s = max(e["idx"], on)
+        # at least 30 ms, or there are too few samples to measure the pitch of a clipped click
+        end = max(event_end(slow, s, floor, fs), s + 1, on + int(0.03 * fs))
+        f = event_features(d["adc"], fs, on, min(end, len(env) - 1), floor, env, slow)
+        e["cls"], e["cls_conf"], e["cls_why"] = classify_sound(f, _rules(), d.get("node"))
+        e["feat"] = f
+
+
+def group_class(g):
+    """Label of a sound heard by several nodes.
+
+    First the kind of sound (hit / cough / speaking / other) by a vote weighted by how clearly each
+    node heard it; then, for a hit, knock vs thud from the node that heard it most clearly, since
+    pitch is only trustworthy at a good SNR (nodes 1/2 read a single knock anywhere in 50-1300 Hz).
+    """
+    family = lambda c: "hit" if c in ("knock", "thud") else c
+    score = {}
+    for e in g.values():
+        k = family(e["cls"])
+        score[k] = score.get(k, 0.0) + e["cls_conf"] * math.log10(max(e["snr"], 1.0) + 1)
+    best = max(score, key=score.get)
+    if best != "hit":
+        return best
+    return max((e for e in g.values() if family(e["cls"]) == "hit"), key=lambda e: e["snr"])["cls"]
 
 
 # ============================================================ analysis
@@ -400,8 +455,11 @@ def analyse(path, pos, temp_c, k, detector="level", ratio=6.0, guided=True):
         else:
             events, floor, thr = detect(t, env, fs, k=k)
             how = f"threshold {thr:.1f}"
-        data[n] = dict(t=t, adc=adc, fs=fs, env=env, events=events, floor=floor, thr=thr)
-        print(f"node {n}: {len(events)} sounds, noise floor {floor:.1f}, {how}")
+        data[n] = dict(node=n, t=t, adc=adc, fs=fs, env=env, events=events, floor=floor, thr=thr)
+        classify_events(data[n], events)
+        counts = {k: sum(e["cls"] == k for e in events) for k in CLASS_COLORS}
+        print(f"node {n}: {len(events)} sounds, noise floor {floor:.1f}, {how}   "
+              + ", ".join(f"{v} {k}" for k, v in counts.items() if v))
     groups = group_events({n: d["events"] for n, d in data.items()}, pos, c)
     if guided and len(nodes) >= 3:
         # A sound heard clearly by 2 nodes happened for sure: look for it at the missing node.
@@ -422,8 +480,11 @@ def analyse(path, pos, temp_c, k, detector="level", ratio=6.0, guided=True):
                         added += 1
         if added:
             print(f"guided search found {added} missed onsets (sounds 2 nodes heard clearly), marked with *")
+    for n, d in data.items():
+        classify_events(d, [g[n] for g in groups if n in g])     # guided onsets
     results = []
-    print(f"\nspeed of sound {c:.1f} m/s\n{'#':>3}  nodes   " + "  ".join(f"t{n} (ms)" for n in nodes) + "   position (m)")
+    print(f"\nspeed of sound {c:.1f} m/s\n{'#':>3}  {'sound':<9} nodes   "
+          + "  ".join(f"t{n} (ms)" for n in nodes) + "   position (m)")
     t_start = min(d["t"][0] for d in data.values())
     for gi, g in enumerate(groups):
         ids = sorted(g)
@@ -434,8 +495,9 @@ def analyse(path, pos, temp_c, k, detector="level", ratio=6.0, guided=True):
                           if n in g else "       - " for n in nodes)
         where = (f"({sol['x']:.2f}, {sol['y']:.2f}) ±{sol['radius95']:.2f}, fit error {sol['resid_m'] * 100:.1f} cm"
                  if sol else ("needs all 3 nodes" if len(ids) < 3 else "missing node positions"))
-        print(f"{gi:>3}  {','.join(map(str, ids)):<6}  {times}   {where}")
-        results.append(dict(group=g, sol=sol))
+        cls = group_class(g)
+        print(f"{gi:>3}  {cls:<9} {','.join(map(str, ids)):<6}  {times}   {where}")
+        results.append(dict(group=g, sol=sol, cls=cls))
     return data, results, c, t_start
 
 
@@ -452,7 +514,7 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
         choose = max(pool, key=lambda i: min(e["snr"] for e in results[i]["group"].values())) if pool else None
     sel = results[choose] if choose is not None and choose < len(results) else None
     if sel:
-        print(f"\nplotting sound #{choose}" + (" (triangulated)" if sel["sol"] else " (not triangulated)"))
+        print(f"\nplotting sound #{choose} ({sel['cls']})" + (" (triangulated)" if sel["sol"] else " (not triangulated)"))
     outdir.mkdir(parents=True, exist_ok=True)
 
     for n, d in sorted(data.items()):
@@ -463,8 +525,9 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
         gaps = np.flatnonzero(np.diff(tms) > 5.0) + 1      # don't draw lines across gaps in the data
         ax.plot(np.insert(tms, gaps, np.nan), np.insert(d["adc"], gaps, np.nan), lw=0.4)
         for e in d["events"]:
-            ax.axvline((e["onset_us"] - t_start) / 1000, color="tab:red", lw=0.7, alpha=0.6)
-        ax.set_title(f"Node {n}: ADC vs time, whole recording ({len(d['events'])} sounds, red = detected onset)")
+            ax.axvline((e["onset_us"] - t_start) / 1000, color=CLASS_COLORS[e["cls"]], lw=0.7, alpha=0.7)
+        _class_legend(ax)
+        ax.set_title(f"Node {n}: ADC vs time, whole recording ({len(d['events'])} sounds, lines = onsets by class)")
         ax.set_xlabel("time (ms, shared clock)")
         ax.set_ylabel("ADC counts")
 
@@ -478,7 +541,8 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
             ax.plot(tms[w], d["env"][w] + np.median(d["adc"]), lw=1.2, alpha=0.8, label="envelope (offset)")
             ax.axvline(on_ms, color="tab:red", ls="--", label=f"onset {on_ms:.3f} ms")
             ax.legend(fontsize=8)
-            ax.set_title(f"Node {n}: ADC vs time, zoom on sound #{choose}")
+            ax.set_title(f"Node {n}: ADC vs time, zoom on sound #{choose}: {sel['cls']} "
+                         f"(this node: {e['cls']}, {e['cls_why']})", fontsize=9)
 
             sol = sel["sol"]
             if sol:
@@ -526,12 +590,13 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
         gaps = np.flatnonzero(np.diff(tms) > 5.0) + 1
         ax.plot(np.insert(tms, gaps, np.nan), np.insert(d["adc"], gaps, np.nan), lw=0.4)
         for e in d["events"]:
-            ax.axvline((e["onset_us"] - t_start) / 1000, color="tab:red", lw=0.7, alpha=0.6)
+            ax.axvline((e["onset_us"] - t_start) / 1000, color=CLASS_COLORS[e["cls"]], lw=0.7, alpha=0.7)
+        _class_legend(ax)
         ax.set_ylabel(f"node {n}\nADC")
         if row == len(nodes) - 1:
             ax.set_xlabel("time (ms, shared clock): the same knock should line up across nodes")
         if row == 0:
-            ax.set_title("All nodes on one time axis (red = detected onsets)")
+            ax.set_title("All nodes on one time axis (lines = detected onsets, coloured by class)")
     axm = fig.add_subplot(gs[:, 1])
     for n, (x, y) in pos.items():
         axm.plot(x, y, "s", ms=12, color="0.3")
@@ -539,8 +604,9 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
     for i, r in enumerate(results):
         if r["sol"]:
             sx, sy = r["sol"]["x"], r["sol"]["y"]
-            axm.plot(sx, sy, "*", ms=14, color="tab:red" if i == choose else "tab:orange")
-            axm.annotate(f"#{i}", (sx, sy), textcoords="offset points", xytext=(6, 6), fontsize=8)
+            axm.plot(sx, sy, "*", ms=18 if i == choose else 13, color=CLASS_COLORS[r["cls"]],
+                     mec="k" if i == choose else "none")
+            axm.annotate(f"#{i} {r['cls']}", (sx, sy), textcoords="offset points", xytext=(6, 6), fontsize=8)
     xs = [p[0] for p in pos.values()]
     ys = [p[1] for p in pos.values()]
     axm.set_xlim(min(xs) - 1, max(xs) + 1)
@@ -554,9 +620,14 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
     f = outdir / "overview.png"
     fig.savefig(f, dpi=110)
     print(f"saved {f}")
-    print("Figures open as separate windows (one per node + overview); they may be stacked on top of each other.")
     if show:
         plt.show()
+
+
+def _class_legend(ax):
+    from matplotlib.lines import Line2D
+    ax.legend(handles=[Line2D([], [], color=c, lw=2, label=k) for k, c in CLASS_COLORS.items()],
+              fontsize=7, loc="upper right", ncol=len(CLASS_COLORS))
 
 
 def load_positions(items, layout=None):
@@ -587,7 +658,7 @@ def main():
     r.add_argument("--ports", nargs="+", required=True)
     r.add_argument("--seconds", type=float, default=20)
     r.add_argument("--out", default="data/run.npz")
-    r.add_argument("--settle", type=float, default=3.0, help="seconds to wait for clock sync before recording")
+    r.add_argument("--settle", type=float, default=0.0, help="optional seconds to skip at the start (default: none)")
     for name in ("plot", "both"):
         p = sub.add_parser(name)
         if name == "plot":
@@ -596,7 +667,7 @@ def main():
             p.add_argument("--ports", nargs="+", required=True)
             p.add_argument("--seconds", type=float, default=20)
             p.add_argument("--out", default="data/run.npz")
-            p.add_argument("--settle", type=float, default=3.0)
+            p.add_argument("--settle", type=float, default=0.0)
         p.add_argument("--pos", nargs="+", help="node positions in meters, e.g. 1=x,y 2=x,y 3=x,y (no default)")
         p.add_argument("--layout", help="layout.json written by live.py calibration (instead of --pos)")
         p.add_argument("--temp", type=float, default=20.0, help="air temperature, C")
