@@ -20,6 +20,7 @@ import pandas as pd
 import yaml
 
 import detect as D
+from style import CHI2_95_2D
 from arraycfg import ROOT, front_vector, load_array, local_angle_to_compass
 from localize import solve_bearing, solve_position
 
@@ -27,6 +28,8 @@ FIX_COLS = ["sound_id", "kind", "wall_time", "bearing_deg", "bearing_sigma_deg",
             "cov_xy", "cov_yy", "residual_m", "label", "confidence", "human_likely", "repeated",
             "true_x_m", "true_y_m", "true_label"]
 HUMAN = {"knock_tap", "voice"}
+DET_COLS = ["sound_id", "ch", "t_s", "sample_index", "peak", "snr", "clipped"]
+
 
 
 # --------------------------------------------------------------------------- labels (placeholder)
@@ -113,28 +116,20 @@ def load_params(path):
     return D.DetectParams(**raw)
 
 
-def run_pipeline(recording, run, array="config/array.yaml", params=None, delays_file="config/channel_delays.yaml",
-                 true_spot=None, true_label=None, start_time=None, sigma_t_s=None):
-    cfg = load_array(array)
-    rec = np.load(ROOT / recording if not Path(recording).is_absolute() else recording)
-    samples, fs = rec["samples"], int(rec["fs_hz"])
-    samples = samples[:, None] if samples.ndim == 1 else samples
-    n_ch = samples.shape[1]
-    if n_ch != len(cfg["_xy"]):
-        raise SystemExit(f"recording has {n_ch} channels but {array} lists {len(cfg['_xy'])} sensors")
-    p = params or D.DetectParams()
-    sigma_t = float(sigma_t_s or cfg["timing"]["sigma_s"])
+def locate_sounds(samples, fs, cfg, p, delays, sigma_t, start, truth_xy=None, true_label=None, single_radius_m=3.0):
+    """Detect -> locate -> label on one block of samples. Times are seconds from the block start;
+    wall_time = start + those seconds. Returns (det, rows, t_event, skipped).
+    One sensor: no direction is possible, so the fix sits ON the node with a circle of
+    single_radius_m (a guessed hearing range, said so in run.yaml and in ATAK)."""
     c, xy, mode = cfg["_c_mps"], cfg["_xy"], cfg["_mode"]
-    delays, calibrated = load_delays(delays_file, n_ch)
-    start = (dt.datetime.fromisoformat(start_time) if start_time
-             else dt.datetime.now(dt.timezone.utc).replace(microsecond=0))
-    truth_xy = find_spot(true_spot) if true_spot else None
-
+    n_ch = samples.shape[1]
     det, _, _ = D.detect_recording(samples, fs, p, xy, c)
     rows, t_event, skipped = [], {}, []
+    if not len(det):
+        return det, rows, t_event, skipped
     for sid, g in det.groupby("sound_id"):
         g = g.drop_duplicates("ch").sort_values("ch")
-        need = 2 if mode == "direction" else 3
+        need = 1 if n_ch == 1 else 2 if mode == "direction" else 3
         if len(g) < need:
             skipped.append((int(sid), len(g)))
             continue
@@ -143,8 +138,12 @@ def run_pipeline(recording, run, array="config/array.yaml", params=None, delays_
         row = dict(sound_id=int(sid), wall_time=(start + dt.timedelta(seconds=max(t.values()) + 0.3)).isoformat(),
                    label=label, confidence=conf, human_likely=label in HUMAN,
                    true_x_m=truth_xy[0] if truth_xy else np.nan, true_y_m=truth_xy[1] if truth_xy else np.nan,
-                   true_label=true_label or (("knock_tap" if true_spot else "")) or np.nan)
-        if mode == "direction":
+                   true_label=true_label or (("knock_tap" if truth_xy else "")) or np.nan)
+        if n_ch == 1:
+            v = single_radius_m ** 2 / CHI2_95_2D
+            row.update(kind="position", x_m=float(xy[0, 0]), y_m=float(xy[0, 1]), cov_xx=v, cov_xy=0.0, cov_yy=v,
+                       residual_m=0.0)
+        elif mode == "direction":
             b = solve_bearing(xy[0], xy[1], t[0], t[1], c, sigma_t, front_vector(xy[0], xy[1], cfg["bearing"]["front"]))
             row.update(kind="bearing", bearing_deg=round(local_angle_to_compass(b["theta_deg"],
                                                                                  cfg["geo"]["x_axis_bearing_deg"]), 2),
@@ -164,17 +163,43 @@ def run_pipeline(recording, run, array="config/array.yaml", params=None, delays_
                        cov_xy=s["cov"][0, 1], cov_yy=s["cov"][1, 1], residual_m=round(s["residual_m"], 4))
         rows.append(row)
         t_event[int(sid)] = float(g.t_s.min())
+    return det, rows, t_event, skipped
 
+
+def finish_fixes(rows, t_event):
+    """Rows -> fixes DataFrame in contract order, with the repeated-knock flag."""
     fixes = pd.DataFrame(rows).reindex(columns=FIX_COLS)
     if len(fixes):
         fixes["repeated"] = flag_repeated(fixes.set_index("sound_id"),
                                           pd.Series(t_event)).reindex(fixes.sound_id).to_numpy()
+    return fixes
+
+
+def run_pipeline(recording, run, array="config/array.yaml", params=None, delays_file="config/channel_delays.yaml",
+                 true_spot=None, true_label=None, start_time=None, sigma_t_s=None, extra_meta=None):
+    cfg = load_array(array)
+    rec = np.load(ROOT / recording if not Path(recording).is_absolute() else recording)
+    samples, fs = rec["samples"], int(rec["fs_hz"])
+    samples = samples[:, None] if samples.ndim == 1 else samples
+    n_ch = samples.shape[1]
+    if n_ch != len(cfg["_xy"]):
+        raise SystemExit(f"recording has {n_ch} channels but {array} lists {len(cfg['_xy'])} sensors")
+    p = params or D.DetectParams()
+    sigma_t = float(sigma_t_s or cfg["timing"]["sigma_s"])
+    c, mode = cfg["_c_mps"], cfg["_mode"]
+    delays, calibrated = load_delays(delays_file, n_ch)
+    start = (dt.datetime.fromisoformat(start_time) if start_time
+             else dt.datetime.now(dt.timezone.utc).replace(microsecond=0))
+    truth_xy = find_spot(true_spot) if true_spot else None
+
+    det, rows, t_event, skipped = locate_sounds(samples, fs, cfg, p, delays, sigma_t, start, truth_xy, true_label)
+    fixes = finish_fixes(rows, t_event)
 
     out = ROOT / "data/runs" / run
     (out / "snippets").mkdir(parents=True, exist_ok=True)
-    D.to_contract(det).to_csv(out / "detections.csv", index=False)
+    (D.to_contract(det) if len(det) else pd.DataFrame(columns=DET_COLS)).to_csv(out / "detections.csv", index=False)
     fixes.to_csv(out / "fixes.csv", index=False)
-    for sid, g in det.groupby("sound_id"):
+    for sid, g in (det.groupby("sound_id") if len(det) else []):
         i0 = int(round(max(g.t_s.min() - 0.25, 0) * fs))
         np.savez_compressed(out / "snippets" / f"{sid}.npz", samples=samples[i0:i0 + fs], fs_hz=fs,
                             sound_id=int(sid), t0_s=i0 / fs)
@@ -187,6 +212,9 @@ def run_pipeline(recording, run, array="config/array.yaml", params=None, delays_
                          else "rules-v0 placeholder (duration + clipping)"),
                 true_spot=true_spot, skipped_sounds=[dict(sound_id=s, reason=(f"heard on {n} sensor(s)" if isinstance(n, int) else n))
                                                      for s, n in skipped])
+    if n_ch == 1:
+        meta["single_sensor"] = "one mic: no direction; fixes sit on the node with a guessed 3 m hearing radius"
+    meta.update(extra_meta or {})
     (out / "run.yaml").write_text(yaml.safe_dump(meta, sort_keys=False))
     return det, fixes, meta
 

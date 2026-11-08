@@ -3,6 +3,7 @@
     python dashboard.py --source sim                          # sim-direction (2 sensors)
     python dashboard.py --source sim --array config/array_triangle.yaml
     python dashboard.py --source replay --run <run>           # any data/runs/<run>/
+    python dashboard.py --source live --run live              # follows live.py while the node streams
 then open http://127.0.0.1:8050  (works on a phone/tablet on the same network with --host 0.0.0.0)
 
 Live tab     : status bar, map (close-up meters / street map / satellite), SOUND SOURCES (human-like
@@ -86,11 +87,32 @@ class PlaybackSource(Source):
         return f, self.det[self.det.sound_id.isin(f.sound_id)]
 
 
-class LiveSource(Source):
-    """Placeholder: implement snapshot() by reading the gateway's growing CSVs."""
+class LiveSource(PlaybackSource):
+    """A run folder that live.py keeps rewriting. Reloads when its files change; the clock is
+    wall time since the stream started, so everything heard so far is on screen."""
 
-    def __init__(self, *a, **k):
-        raise NotImplementedError("live source not built yet: use --source sim or --source replay")
+    def __init__(self, run_dir: Path, array_path: str | None = None):
+        self._array_path, self._mtime = array_path, None
+        self.run_dir = run_dir
+        self.refresh()
+
+    def refresh(self):
+        import os
+        m = os.stat(self.run_dir / "run.yaml").st_mtime
+        if m != self._mtime:
+            for _ in range(3):   # live.py replaces files atomically; retry if caught between two of them
+                try:
+                    PlaybackSource.__init__(self, self.run_dir, self._array_path)
+                    break
+                except (pd.errors.EmptyDataError, PermissionError, KeyError):
+                    __import__("time").sleep(0.05)
+            self._mtime = m
+            self._t0 = pd.Timestamp(self.meta["start_time"]).timestamp()
+        self.duration_s = 1e9
+
+    def now(self):
+        import time   # stream time; never behind what live.py has processed (matters for sped-up --fake)
+        return max(time.time() - self._t0, float(self.meta.get("duration_s", 0) or 0))
 
 
 def list_runs():
@@ -151,6 +173,8 @@ def where_text(src, c):
     xb = src.cfg["geo"]["x_axis_bearing_deg"]
     if c["kind"] == "position":
         xy = src.cfg["_xy"]
+        if len(xy) == 1:
+            return f"Near {src.cfg['_names'][0]} (one mic: no direction)", f"~{c['r95']:.0f} m (guessed range)"
         d = np.hypot(xy[:, 0] - c["x"], xy[:, 1] - c["y"])
         k = int(d.argmin())
         ang = np.degrees(np.arctan2(c["y"] - xy[k, 1], c["x"] - xy[k, 0]))
@@ -196,6 +220,8 @@ def build_contacts(fixes):
             info = sum(w for _, w in c["info"])
             cov = np.linalg.inv(info)
             x = cov @ sum(w @ p for p, w in c["info"])
+            if all(np.array_equal(p, c["info"][0][0]) for p, _ in c["info"]):
+                cov = np.linalg.inv(c["info"][0][1])   # one-mic fixes all sit on the node: repeats add no position info
             c.update(x=float(x[0]), y=float(x[1]), cov=cov, r95=r95_cov(cov))
         else:
             c["info"].append((r.bearing_deg, 1 / r.bearing_sigma_deg ** 2))
@@ -555,8 +581,14 @@ def build_app(initial_run: str, array_override: str | None = None, start_tab: st
 
     def get_src(run):
         if run not in cache:
-            cache[run] = PlaybackSource(ROOT / "data/runs" / run, array_override if run == initial_run else None)
-        return cache[run]
+            d = ROOT / "data/runs" / run
+            meta = yaml.safe_load((d / "run.yaml").read_text()) if (d / "run.yaml").exists() else {}
+            cls = LiveSource if (meta or {}).get("source") == "live" else PlaybackSource
+            cache[run] = cls(d, array_override if run == initial_run else None)
+        src = cache[run]
+        if isinstance(src, LiveSource):
+            src.refresh()
+        return src
 
     app = Dash(__name__, title="Drop-and-Listen", assets_folder=str(ROOT / "assets"),
                suppress_callback_exceptions=True)
@@ -668,6 +700,8 @@ def build_app(initial_run: str, array_override: str | None = None, start_tab: st
             st = {"t": 0.0, "playing": True}
         elif trig == "all":
             st = {"t": src.duration_s, "playing": False}
+        elif isinstance(src, LiveSource):
+            st = {"t": src.now(), "playing": True}
         elif st["playing"]:
             st["t"] = min(st["t"] + TICK_S * speed, src.duration_s)
             if st["t"] >= src.duration_s:
@@ -804,7 +838,11 @@ def initial_run_for(args):
         if not (ROOT / "data/runs" / args.run / "fixes.csv").exists():
             raise SystemExit(f"data/runs/{args.run}/fixes.csv not found")
         return args.run, args.array
-    LiveSource()
+    run = args.run or "live"
+    meta_p = ROOT / "data/runs" / run / "run.yaml"
+    if not meta_p.exists() or (yaml.safe_load(meta_p.read_text()) or {}).get("source") != "live":
+        raise SystemExit(f"data/runs/{run} is not a live run yet: start `python live.py --port COM5 --run {run}` first")
+    return run, args.array
 
 
 if __name__ == "__main__":

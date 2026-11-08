@@ -1,0 +1,17 @@
+# One mic on one node (firmware N_CH = 1). No direction or position is possible with one
+# sensor: live.py / pipeline.py put each sound ON the node with a guessed hearing radius.
+# Same geo block as array.yaml so markers land in the same place in ATAK.
+medium: air
+conditions:
+  temperature_c: 20
+  humidity_pct: 50
+sampling:
+  fs_hz: 24000
+sensors:
+  - {ch: 0, name: DNL-S1, x_m: 0.0, y_m: 0.0}
+timing:
+  sigma_s: 0.0001
+geo:
+  lat0: 42.36030
+  lon0: -71.05880
+  x_axis_bearing_deg: 90

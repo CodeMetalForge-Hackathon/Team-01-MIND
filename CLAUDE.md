@@ -147,6 +147,7 @@ localize.py*       TDOA position / bearing solver        arraycfg.py*  array.yam
 classify.py        classifier (rules vs model, by-session eval)  features.py  clip features
 calibrate.py       delays, jitter, repeatability (Plots 9, 4)   accuracy.py  heatmap + error vs jitter (Plots 3, 10)
 dashboard.py       mission-control web app (+ assets/dashboard.css)
+live.py            live: serial node (or --fake npz) -> sliding-window pipeline -> data/runs/<run> + ATAK
 atak.py            CoT sender: sound sources + sensors to ATAK (multicast 239.2.3.1:6969 or phone:4242)
 config/            array.yaml (M0 schema), array_triangle.yaml, cal_spots.yaml, channel_delays.yaml (from calibration)
 notebooks/         01 tune detection, 02 calibration, 03 accuracy map, 04 classification
@@ -176,4 +177,7 @@ python pipeline.py data/recordings/stage2.npz --run stage2                      
 python classify.py                                                                    # train classifier
 python dashboard.py --source replay --run stage2                                      # or Setup tab: Process
 python atak.py --test                                                                 # test marker in ATAK
+python live.py --port COM5 --atak 127.0.0.1:4242                                   # LIVE: node -> ATAK (+ data/runs/live)
+python live.py --fake data/recordings/sim-position.npz                               # same, no hardware
+python dashboard.py --source live --run live                                          # dashboard follows live.py
 ```

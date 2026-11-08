@@ -4,6 +4,9 @@
 //   nodes 2 and 3 sync to it. The laptop then lines up all three recordings to microseconds.
 // Boards: Feather ESP32-S2 (pin 9) = node 1, XIAO ESP32-C5 (D0) = node 2,
 // XIAO ESP32-S3 Plus (D0) = node 3. IDs are automatic by chip. USB CDC On Boot: Enabled.
+// Node 1 (S2) also reads an analog vibration sensor on GPIO8, sampled by the same ADC right
+// after each sound sample (same clock). Its packets carry channel 1 in the header's last byte;
+// sound packets carry 0, so older laptop tools that ignore that byte keep working.
 // The only text this sketch prints is one boot line; everything else is binary packets.
 #include <Arduino.h>
 #include <WiFi.h>
@@ -13,7 +16,9 @@
 #include "esp_adc/adc_continuous.h"
 
 // ------------------------------------------------------------------ settings
-#define FORCE_NODE_ID 3          // 0 = automatic; or 1, 2, 3 to force this board's ID
+#define FORCE_NODE_ID 0          // 0 = automatic by chip (S2 = 1, C5 = 2, S3 = 3). Only force an ID
+                                 // when flashing ONE board, and set it back to 0 before flashing the next:
+                                 // two boards with the same ID get ignored, and with no node 1 nobody syncs.
 #define FS_HZ 10000              // samples per second
 #define N_PER_PACKET 250         // 25 ms per packet
 #define ESPNOW_CHANNEL 1
@@ -27,6 +32,7 @@ static const MacId MAC_TABLE[] = {
 
 #if CONFIG_IDF_TARGET_ESP32S2
 #define SOUND_PIN 9              // Feather ESP32-S2: pin 9 (ADC1)
+#define VIB_PIN 8                // vibration sensor: GPIO8 (ADC1_CH7). -1 = no vibration sensor
 #define DEFAULT_ID 1
 #elif CONFIG_IDF_TARGET_ESP32C5
 #define SOUND_PIN 1              // XIAO ESP32-C5: D0 = GPIO1
@@ -38,6 +44,12 @@ static const MacId MAC_TABLE[] = {
 #define SOUND_PIN 1
 #define DEFAULT_ID 2
 #endif
+#ifndef VIB_PIN
+#define VIB_PIN -1               // only node 1 has a vibration sensor
+#endif
+#define N_CH (VIB_PIN >= 0 ? 2 : 1)
+#define CH_SOUND 0               // StreamHeader.reserved: which sensor the packet holds
+#define CH_VIB 1
 
 #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
 #define ADC_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE1
@@ -66,7 +78,7 @@ struct StreamHeader {            // USB, node -> laptop
   int64_t first_t_us;            // shared-clock time of the first sample in this packet
   uint16_t n;
   uint8_t overflows;
-  uint8_t reserved;
+  uint8_t reserved;              // channel: 0 = sound, 1 = vibration
 };
 #pragma pack(pop)
 
@@ -126,6 +138,7 @@ static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len
 // ------------------------------------------------------------------ ADC
 static adc_continuous_handle_t adc = nullptr;
 static adc_channel_t soundChannel;
+static adc_channel_t vibChannel = (adc_channel_t)-1;
 static volatile uint32_t overflows = 0;
 static uint32_t lastOverflows = 0;
 static uint8_t adcBuf[256 * SOC_ADC_DIGI_RESULT_BYTES];
@@ -137,20 +150,26 @@ static bool IRAM_ATTR onOverflow(adc_continuous_handle_t, const adc_continuous_e
 
 static void setupAdc() {
   adc_continuous_handle_cfg_t hcfg = {};
-  hcfg.max_store_buf_size = 4096;
+  hcfg.max_store_buf_size = 4096 * N_CH;
   hcfg.conv_frame_size = sizeof(adcBuf);
   ESP_ERROR_CHECK(adc_continuous_new_handle(&hcfg, &adc));
   adc_unit_t unit;
   ESP_ERROR_CHECK(adc_continuous_io_to_channel(SOUND_PIN, &unit, &soundChannel));
-  adc_digi_pattern_config_t pattern = {};
-  pattern.atten = ADC_ATTEN_DB_12;
-  pattern.channel = soundChannel;
-  pattern.unit = unit;
-  pattern.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+  adc_digi_pattern_config_t pattern[2] = {};
+  pattern[0].atten = ADC_ATTEN_DB_12;
+  pattern[0].channel = soundChannel;
+  pattern[0].unit = unit;
+  pattern[0].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+#if VIB_PIN >= 0
+  adc_unit_t vunit;
+  ESP_ERROR_CHECK(adc_continuous_io_to_channel(VIB_PIN, &vunit, &vibChannel));
+  pattern[1] = pattern[0];       // same unit (ADC1), attenuation and width; sampled right after sound
+  pattern[1].channel = vibChannel;
+#endif
   adc_continuous_config_t cfg = {};
-  cfg.pattern_num = 1;
-  cfg.adc_pattern = &pattern;
-  cfg.sample_freq_hz = FS_HZ;
+  cfg.pattern_num = N_CH;
+  cfg.adc_pattern = pattern;
+  cfg.sample_freq_hz = FS_HZ * N_CH;   // total conversions/s: FS_HZ per sensor
   cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
   cfg.format = ADC_FORMAT;
   ESP_ERROR_CHECK(adc_continuous_config(adc, &cfg));
@@ -165,6 +184,11 @@ static uint16_t pkt[N_PER_PACKET];
 static int pktFill = 0;
 static uint16_t seq = 0;
 static int64_t totalSamples = 0;
+// vibration (node 1 only): own buffer, sample count and packet sequence
+static uint16_t vpkt[N_PER_PACKET];
+static int vpktFill = 0;
+static uint16_t vseq = 0;
+static int64_t vTotalSamples = 0;
 
 // ---- sample timing: sample index -> local microseconds ----------------------------------
 // A line fitted over the last ~1.5 s of (sample index, time the ADC buffer arrived), using only
@@ -210,34 +234,43 @@ static int64_t sampleLocalTime(int64_t idx) {
   return lastTEnd - (int64_t)llround((double)(lastIdxEnd - idx) * dtUs);   // until the fit is ready
 }
 
-static void sendPacket(int64_t firstSampleIndex) {
+// ch = CH_SOUND or CH_VIB. Both sensors share the sound channel's sample timing: vibration
+// sample k is converted right after sound sample k, i.e. half a sample period later.
+static void sendPacket(const uint16_t *buf, int64_t firstSampleIndex, uint8_t ch, uint16_t &seqRef) {
+  const size_t bytes = N_PER_PACKET * sizeof(uint16_t);
 #if ARDUINO_USB_MODE
   // C5 / S3 USB: only send a packet if it fits completely; otherwise skip it whole.
   // (A half-sent packet would corrupt the stream; a skipped one just shows as "dropped".)
-  const int need = sizeof(StreamHeader) + sizeof(pkt) + 2;
-  if (Serial.availableForWrite() < need) { seq++; return; }
+  const int need = sizeof(StreamHeader) + bytes + 2;
+  if (Serial.availableForWrite() < need) { seqRef++; return; }
 #endif
   StreamHeader h;
   h.magic = 0x5AA6;
   h.node = nodeId;
   h.synced = isSynced();
-  h.seq = seq++;
+  h.seq = seqRef++;
   h.fs_hz = (uint32_t)llround(1e6 / dtUs);   // measured rate (some chips don't sample exactly at FS_HZ)
   h.first_index = (uint32_t)firstSampleIndex;
-  h.first_t_us = toShared(sampleLocalTime(firstSampleIndex));
+  int64_t tLocal = sampleLocalTime(firstSampleIndex);
+  if (ch == CH_VIB) tLocal += (int64_t)llround(dtUs / N_CH);
+  h.first_t_us = toShared(tLocal);
   h.n = N_PER_PACKET;
-  uint32_t ov = overflows;
-  uint32_t newOv = ov - lastOverflows;
-  lastOverflows = ov;
-  h.overflows = newOv > 255 ? 255 : newOv;
-  h.reserved = 0;
+  uint8_t ovOut = 0;
+  if (ch == CH_SOUND) {                       // overflows are reported once, on the sound stream
+    uint32_t ov = overflows;
+    uint32_t newOv = ov - lastOverflows;
+    lastOverflows = ov;
+    ovOut = newOv > 255 ? 255 : newOv;
+  }
+  h.overflows = ovOut;
+  h.reserved = ch;
   uint16_t sum = 0;
   const uint8_t *hb = (const uint8_t *)&h;
   for (size_t i = 0; i < sizeof(h); i++) sum += hb[i];
-  const uint8_t *sb = (const uint8_t *)pkt;
-  for (size_t i = 0; i < sizeof(pkt); i++) sum += sb[i];
+  const uint8_t *sb = (const uint8_t *)buf;
+  for (size_t i = 0; i < bytes; i++) sum += sb[i];
   Serial.write(hb, sizeof(h));
-  Serial.write(sb, sizeof(pkt));
+  Serial.write(sb, bytes);
   Serial.write((const uint8_t *)&sum, 2);
 }
 
@@ -279,8 +312,8 @@ void setup() {
     peer.encrypt = false;
     esp_now_add_peer(&peer);
   }
-  Serial.printf("\nDNL node %u %s MAC %s pin %d\n", nodeId, isMaster ? "(time master)" : "",
-                WiFi.macAddress().c_str(), SOUND_PIN);
+  Serial.printf("\nDNL node %u %s MAC %s pin %d vibration pin %d\n", nodeId, isMaster ? "(time master)" : "",
+                WiFi.macAddress().c_str(), SOUND_PIN, VIB_PIN);
   setupAdc();
 }
 
@@ -319,12 +352,28 @@ void loop() {
 
   for (int i = 0; i < results; i++) {
     adc_digi_output_data_t *p = (adc_digi_output_data_t *)&adcBuf[i * SOC_ADC_DIGI_RESULT_BYTES];
-    if (ADC_CH(p) != soundChannel) continue;
-    pkt[pktFill++] = ADC_DATA(p);
-    totalSamples++;
-    if (pktFill == N_PER_PACKET) {
-      sendPacket(totalSamples - N_PER_PACKET);
-      pktFill = 0;
+    uint32_t chn = ADC_CH(p);
+    if (chn == (uint32_t)soundChannel) {
+      pkt[pktFill++] = ADC_DATA(p);
+      totalSamples++;
+      if (pktFill == N_PER_PACKET) {
+        sendPacket(pkt, totalSamples - N_PER_PACKET, CH_SOUND, seq);
+        pktFill = 0;
+      }
+    } else if (VIB_PIN >= 0 && chn == (uint32_t)vibChannel) {
+      // keep vibration index k paired with sound index k (the conversion right after it)
+      if (vTotalSamples >= totalSamples) continue;          // lost its sound partner: skip
+      if (vTotalSamples < totalSamples - 1) {               // sound got ahead (lost vib): realign
+        vTotalSamples = totalSamples - 1;
+        vpktFill = 0;
+      }
+      if (vpktFill == 0 && vTotalSamples % N_PER_PACKET != 0) continue;   // start packets aligned
+      vpkt[vpktFill++] = ADC_DATA(p);
+      vTotalSamples++;
+      if (vpktFill == N_PER_PACKET) {
+        sendPacket(vpkt, vTotalSamples - N_PER_PACKET, CH_VIB, vseq);
+        vpktFill = 0;
+      }
     }
   }
 }

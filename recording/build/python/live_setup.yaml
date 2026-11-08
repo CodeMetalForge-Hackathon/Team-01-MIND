@@ -1,0 +1,23 @@
+# live.py setup: edit this once per deployment, then just run  python live.py  (or press Play).
+# It starts sensing and plotting immediately; no tap calibration.
+
+# USB ports of the nodes. Leave empty to find the ESP32 boards automatically.
+ports: []                     # e.g. [COM11, COM12, COM13]
+
+# Node positions in metres, in your own site frame (tape-measure them; any origin works).
+nodes:
+  1: [0.0, 0.0]
+  2: [2.5, 0.0]
+  3: [1.43, 1.8]
+
+# Orientation of the site frame: compass bearing of the +x axis, degrees clockwise from north.
+#   0 = +x points north, 90 = +x points east. The +y axis is 90 degrees anticlockwise from +x.
+# Stand at the origin, face along +x, read the phone compass.
+heading_deg: 0
+
+# Optional, for ATAK markers: GPS of the frame origin (the point x = 0, y = 0). Leave null without ATAK.
+origin:
+  lat: null
+  lon: null
+
+temp_c: 20                    # air temperature (speed of sound)
