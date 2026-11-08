@@ -1,0 +1,259 @@
+// dnl_stream_node: ONE sketch for all three nodes.
+// Streams raw Grove sound samples over USB, stamped with a SHARED clock:
+//   node 1 (the S2) is the time master and broadcasts its clock over ESP-NOW every 0.5 s;
+//   nodes 2 and 3 sync to it. The laptop then lines up all three recordings to microseconds.
+// Boards: Feather ESP32-S2 (pin 9) = node 1, XIAO ESP32-C5 (D0) = node 2,
+// XIAO ESP32-S3 Plus (D0) = node 3. IDs are automatic by chip. USB CDC On Boot: Enabled.
+// The only text this sketch prints is one boot line; everything else is binary packets.
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "soc/soc_caps.h"
+#include "esp_adc/adc_continuous.h"
+
+// ------------------------------------------------------------------ settings
+#define FORCE_NODE_ID 0          // 0 = automatic; or 1, 2, 3 to force this board's ID
+#define FS_HZ 10000              // samples per second
+#define N_PER_PACKET 250         // 25 ms per packet
+#define ESPNOW_CHANNEL 1
+
+struct MacId { uint8_t mac[6]; uint8_t id; };
+// After the first flash, each C5 prints "MAC xx:xx:..". Put them here and reflash, or use FORCE_NODE_ID.
+static const MacId MAC_TABLE[] = {
+  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 2},   // TODO: node 2 C5 MAC
+  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, 3},   // TODO: node 3 C5 MAC
+};
+
+#if CONFIG_IDF_TARGET_ESP32S2
+#define SOUND_PIN 9              // Feather ESP32-S2: pin 9 (ADC1)
+#define DEFAULT_ID 1
+#elif CONFIG_IDF_TARGET_ESP32C5
+#define SOUND_PIN 1              // XIAO ESP32-C5: D0 = GPIO1
+#define DEFAULT_ID 2
+#elif CONFIG_IDF_TARGET_ESP32S3
+#define SOUND_PIN 1              // Seeed XIAO ESP32-S3 Plus: D0 = GPIO1 (ADC1)
+#define DEFAULT_ID 3             // node 3 automatically
+#else
+#define SOUND_PIN 1
+#define DEFAULT_ID 2
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+#define ADC_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE1
+#define ADC_CH(p) ((p)->type1.channel)
+#define ADC_DATA(p) ((p)->type1.data)
+#else
+#define ADC_FORMAT ADC_DIGI_OUTPUT_FORMAT_TYPE2
+#define ADC_CH(p) ((p)->type2.channel)
+#define ADC_DATA(p) ((p)->type2.data)
+#endif
+
+// ------------------------------------------------------------------ packets
+#pragma pack(push, 1)
+struct Beacon {                  // ESP-NOW, node 1 -> others
+  uint8_t magic;                 // 0xB5
+  uint32_t seq;
+  int64_t master_us;
+};
+struct StreamHeader {            // USB, node -> laptop
+  uint16_t magic;                // 0x5AA6
+  uint8_t node;
+  uint8_t synced;
+  uint16_t seq;
+  uint32_t fs_hz;
+  uint32_t first_index;
+  int64_t first_t_us;            // shared-clock time of the first sample in this packet
+  uint16_t n;
+  uint8_t overflows;
+  uint8_t reserved;
+};
+#pragma pack(pop)
+
+static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static uint8_t nodeId = DEFAULT_ID;
+static bool isMaster = false;
+
+// ------------------------------------------------------------------ clock sync (nodes 2, 3)
+static portMUX_TYPE syncMux = portMUX_INITIALIZER_UNLOCKED;
+static const int NB = 8;
+static int64_t bLoc[NB], bMas[NB];
+static int bHead = 0, bCount = 0;
+static int64_t lastBeaconLocal = 0, refX = 0, refY = 0;
+static double fitA = 0, fitB = 1;
+
+static void fitClock() {
+  int64_t x0 = bLoc[0], y0 = bMas[0];
+  double mx = 0, my = 0;
+  for (int i = 0; i < bCount; i++) { mx += (double)(bLoc[i] - x0); my += (double)(bMas[i] - y0); }
+  mx /= bCount; my /= bCount;
+  double sxy = 0, sxx = 0;
+  for (int i = 0; i < bCount; i++) {
+    double dx = (double)(bLoc[i] - x0) - mx, dy = (double)(bMas[i] - y0) - my;
+    sxy += dx * dy; sxx += dx * dx;
+  }
+  fitB = sxx > 0 ? sxy / sxx : 1.0;
+  fitA = my - fitB * mx;
+  refX = x0; refY = y0;
+}
+
+static bool isSynced() {
+  if (isMaster) return true;
+  return bCount >= 2 && (esp_timer_get_time() - lastBeaconLocal) < 3000000;
+}
+
+static int64_t toShared(int64_t localUs) {
+  if (isMaster) return localUs;
+  portENTER_CRITICAL(&syncMux);
+  int64_t out = bCount >= 2 ? refY + (int64_t)llround(fitA + fitB * (double)(localUs - refX)) : localUs;
+  portEXIT_CRITICAL(&syncMux);
+  return out;
+}
+
+static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  int64_t now = esp_timer_get_time();           // capture first
+  if (isMaster || len < (int)sizeof(Beacon) || data[0] != 0xB5) return;
+  const Beacon *b = (const Beacon *)data;
+  portENTER_CRITICAL(&syncMux);
+  bLoc[bHead] = now; bMas[bHead] = b->master_us;
+  bHead = (bHead + 1) % NB;
+  if (bCount < NB) bCount++;
+  lastBeaconLocal = now;
+  if (bCount >= 2) fitClock();
+  portEXIT_CRITICAL(&syncMux);
+}
+
+// ------------------------------------------------------------------ ADC
+static adc_continuous_handle_t adc = nullptr;
+static adc_channel_t soundChannel;
+static volatile uint32_t overflows = 0;
+static uint32_t lastOverflows = 0;
+static uint8_t adcBuf[256 * SOC_ADC_DIGI_RESULT_BYTES];
+
+static bool IRAM_ATTR onOverflow(adc_continuous_handle_t, const adc_continuous_evt_data_t *, void *) {
+  overflows++;
+  return false;
+}
+
+static void setupAdc() {
+  adc_continuous_handle_cfg_t hcfg = {};
+  hcfg.max_store_buf_size = 4096;
+  hcfg.conv_frame_size = sizeof(adcBuf);
+  ESP_ERROR_CHECK(adc_continuous_new_handle(&hcfg, &adc));
+  adc_unit_t unit;
+  ESP_ERROR_CHECK(adc_continuous_io_to_channel(SOUND_PIN, &unit, &soundChannel));
+  adc_digi_pattern_config_t pattern = {};
+  pattern.atten = ADC_ATTEN_DB_12;
+  pattern.channel = soundChannel;
+  pattern.unit = unit;
+  pattern.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+  adc_continuous_config_t cfg = {};
+  cfg.pattern_num = 1;
+  cfg.adc_pattern = &pattern;
+  cfg.sample_freq_hz = FS_HZ;
+  cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+  cfg.format = ADC_FORMAT;
+  ESP_ERROR_CHECK(adc_continuous_config(adc, &cfg));
+  adc_continuous_evt_cbs_t cbs = {};
+  cbs.on_pool_ovf = onOverflow;
+  adc_continuous_register_event_callbacks(adc, &cbs, nullptr);
+  ESP_ERROR_CHECK(adc_continuous_start(adc));
+}
+
+// ------------------------------------------------------------------ streaming
+static uint16_t pkt[N_PER_PACKET];
+static int pktFill = 0;
+static uint16_t seq = 0;
+static int64_t totalSamples = 0, firstIdx = -1, firstT = 0;
+static double dtUs = 1e6 / FS_HZ;
+
+static void sendPacket(int64_t firstSampleIndex) {
+  StreamHeader h;
+  h.magic = 0x5AA6;
+  h.node = nodeId;
+  h.synced = isSynced();
+  h.seq = seq++;
+  h.fs_hz = FS_HZ;
+  h.first_index = (uint32_t)firstSampleIndex;
+  int64_t localFirst = firstT + (int64_t)((firstSampleIndex - firstIdx) * dtUs);
+  h.first_t_us = toShared(localFirst);
+  h.n = N_PER_PACKET;
+  uint32_t ov = overflows;
+  uint32_t newOv = ov - lastOverflows;
+  lastOverflows = ov;
+  h.overflows = newOv > 255 ? 255 : newOv;
+  h.reserved = 0;
+  uint16_t sum = 0;
+  const uint8_t *hb = (const uint8_t *)&h;
+  for (size_t i = 0; i < sizeof(h); i++) sum += hb[i];
+  const uint8_t *sb = (const uint8_t *)pkt;
+  for (size_t i = 0; i < sizeof(pkt); i++) sum += sb[i];
+  Serial.write(hb, sizeof(h));
+  Serial.write(sb, sizeof(pkt));
+  Serial.write((const uint8_t *)&sum, 2);
+}
+
+static uint8_t lookupId() {
+  if (FORCE_NODE_ID) return FORCE_NODE_ID;
+#if CONFIG_IDF_TARGET_ESP32S2
+  return 1;
+#else
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  for (const MacId &m : MAC_TABLE)
+    if (memcmp(m.mac, mac, 6) == 0) return m.id;
+  return DEFAULT_ID;
+#endif
+}
+
+void setup() {
+  Serial.begin(921600);
+  delay(800);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+#ifdef SOC_WIFI_SUPPORT_5G
+  esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
+#endif
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  nodeId = lookupId();
+  isMaster = (nodeId == 1);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onRecv);
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, BROADCAST, 6);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+  }
+  Serial.printf("\nDNL node %u %s MAC %s pin %d\n", nodeId, isMaster ? "(time master)" : "",
+                WiFi.macAddress().c_str(), SOUND_PIN);
+  setupAdc();
+}
+
+void loop() {
+  if (isMaster) {
+    static uint32_t lastBeacon = 0, beaconSeq = 0;
+    if (millis() - lastBeacon >= 500) {
+      lastBeacon = millis();
+      Beacon b = {0xB5, beaconSeq++, esp_timer_get_time()};
+      esp_now_send(BROADCAST, (const uint8_t *)&b, sizeof(b));
+    }
+  }
+
+  uint32_t n = 0;
+  if (adc_continuous_read(adc, adcBuf, sizeof(adcBuf), &n, 20) != ESP_OK) return;
+  int64_t tEnd = esp_timer_get_time();
+  int results = n / SOC_ADC_DIGI_RESULT_BYTES;
+  if (firstIdx < 0) { firstIdx = totalSamples; firstT = tEnd - (int64_t)(results * dtUs); }
+  for (int i = 0; i < results; i++) {
+    adc_digi_output_data_t *p = (adc_digi_output_data_t *)&adcBuf[i * SOC_ADC_DIGI_RESULT_BYTES];
+    if (ADC_CH(p) != soundChannel) continue;
+    pkt[pktFill++] = ADC_DATA(p);
+    totalSamples++;
+    if (pktFill == N_PER_PACKET) {
+      sendPacket(totalSamples - N_PER_PACKET);
+      pktFill = 0;
+    }
+  }
+  if (totalSamples - firstIdx > FS_HZ) dtUs = (double)(tEnd - firstT) / (double)(totalSamples - firstIdx);
+}
