@@ -94,7 +94,9 @@ def source_events(src, contacts, acks, run):
         uid = f"DNL-{run}-{c['cid']}"
         remarks = (f"{where} ({acc}). {len(c['sounds'])} sounds"
                    + (", regular knock pattern" if c["repeated"] else "") + f". Confidence {c['conf']:.0%}."
-                   + (" Direction only: the person is somewhere in the wedge." if c["kind"] == "bearing" else ""))
+                   + (" Direction only: the person is somewhere in the wedge." if c["kind"] == "bearing" else "")
+                   + (" One mic only: no direction; the circle is a guessed hearing range around the node."
+                      if len(src.cfg["_xy"]) == 1 else ""))
         detail = (f'<contact callsign="{escape(name)}"/><remarks>{escape(remarks)}</remarks>'
                   f'<color argb="{argb(rgb)}"/><usericon iconsetpath="COT_MAPPING_SPOTMAP/{SPOT}/{argb(rgb)}"/>'
                   f'<precisionlocation altsrc="???" geopointsrc="DNL-TDOA"/>')
