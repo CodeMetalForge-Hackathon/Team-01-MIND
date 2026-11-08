@@ -166,8 +166,21 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--test", action="store_true", help="send one test marker at the map origin and exit")
     ap.add_argument("--print", action="store_true", help="print the CoT instead of sending")
+    ap.add_argument("--node-coords", metavar="ARRAY", nargs="?", const="config/array.yaml",
+                    help="print NODE_LAT / NODE_LON for the ESP32 firmware (center of the sensors in ARRAY)")
     args = ap.parse_args()
     from arraycfg import ROOT, load_array
+    if args.node_coords:
+        import dashboard as Db
+        cfg = load_array(args.node_coords)
+
+        class _S:  # minimal stand-in so to_latlon can read the geo block
+            pass
+        s = _S()
+        s.cfg = cfg
+        la, lo = Db.to_latlon(s, cfg["_xy"][:, 0], cfg["_xy"][:, 1])
+        print(f"static const double NODE_LAT = {la.mean():.7f};\nstatic const double NODE_LON = {lo.mean():.7f};")
+        return
     sender = CotSender(args.to or ["multicast"], args.iface)
     if args.test or not args.run:
         g = load_array("config/array.yaml")["geo"]

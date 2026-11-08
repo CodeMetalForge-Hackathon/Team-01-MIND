@@ -6,7 +6,7 @@ conditions:
   temperature_c: 20
   humidity_pct: 50
 sampling:
-  fs_hz: 10000
+  fs_hz: 24000
 sensors:
   - {ch: 0, name: DNL-S1, x_m: 0.0, y_m: 0.0}
   - {ch: 1, name: DNL-S2, x_m: 2.0, y_m: 0.0}
