@@ -328,6 +328,26 @@ def to_latlon(src, x, y):
     lon = g["lon0"] + east / (111320.0 * np.cos(np.radians(g["lat0"])))
     return lat, lon
 
+def node_sensors_panel(array_path="config/array.yaml"):
+    """Node sensors: microphones (live), humidity/temperature (sets the speed of sound), thermal (status)."""
+    from dash import html
+    try:
+        cfg = load_array(array_path)
+        cond = cfg.get("conditions", {})
+        t, rh, c = cond.get("temperature_c", 20), cond.get("humidity_pct", 50), cfg["_c_mps"]
+        n = len(cfg["_xy"])
+        env = f"{t} °C · {rh}% RH → speed of sound {c:.1f} m/s (used for every location)"
+    except Exception as e:  # never let this panel break the dashboard
+        n, env = "?", f"could not read {array_path}: {e}"
+    row = lambda name, state, text: html.Div([html.B(name), html.Span(f"  [{state}]  "), html.Span(text)],
+                                             style={"margin": "6px 0", "fontSize": 15})
+    return html.Div(className="panel", children=[
+        html.H2("Node sensors"),
+        row("Microphones", "live", f"{n} sensors, timing → position"),
+        row("Humidity + temperature", "config", env),
+        html.Div("Set temperature_c / humidity_pct in config/array.yaml from the node's reading.", className="msg"),
+        row("Thermal camera", "not connected", "confirms a warm body near a contact; integration in progress"),
+    ])
 
 ESRI_SAT = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 
@@ -624,6 +644,7 @@ def build_app(initial_run: str, array_override: str | None = None, start_tab: st
                         dcc.Loading(html.Div(id="process-msg", className="msg")),
                     ]),
                     html.Div(className="panel", children=[
+                        node_sensors_panel(),
                         html.H2("ATAK link"),
                         html.Div("Sends each sound source (one marker per place, with its accuracy circle and "
                                  "area) and the sensors to ATAK phones on the same Wi-Fi / hotspot. Only "
