@@ -1,0 +1,108 @@
+{
+ "pos": {
+  "1": [
+   0.0,
+   0.0
+  ],
+  "2": [
+   2.5,
+   0.0
+  ],
+  "3": [
+   1.43,
+   1.8
+  ]
+ },
+ "temp": 20.0,
+ "blocks": [
+  {
+   "kind": "quiet",
+   "label": "quiet",
+   "spot": null,
+   "truth": null,
+   "prep_s": 0.0,
+   "start_s": 0.0,
+   "end_s": 5.0,
+   "prompt": "STAY QUIET"
+  },
+  {
+   "kind": "knock",
+   "label": "knock_A",
+   "spot": "A",
+   "truth": [
+    1.09,
+    0.51
+   ],
+   "prep_s": 5.0,
+   "start_s": 9.0,
+   "end_s": 21.0,
+   "prompt": "spot A: knock 5 times with something hard (a pan or a box), about 2 s apart"
+  },
+  {
+   "kind": "knock",
+   "label": "knock_B",
+   "spot": "B",
+   "truth": [
+    1.73,
+    0.79
+   ],
+   "prep_s": 21.0,
+   "start_s": 25.0,
+   "end_s": 37.0,
+   "prompt": "spot B: knock 5 times with something hard (a pan or a box), about 2 s apart"
+  },
+  {
+   "kind": "knock",
+   "label": "knock_C",
+   "spot": "C",
+   "truth": [
+    0.84,
+    1.12
+   ],
+   "prep_s": 37.0,
+   "start_s": 41.0,
+   "end_s": 53.0,
+   "prompt": "spot C: knock 5 times with something hard (a pan or a box), about 2 s apart"
+  },
+  {
+   "kind": "voice",
+   "label": "voice_A",
+   "spot": "A",
+   "truth": [
+    1.09,
+    0.51
+   ],
+   "prep_s": 53.0,
+   "start_s": 57.0,
+   "end_s": 69.0,
+   "prompt": "spot A: say \"help, I'm here\" 3 times, pausing between"
+  },
+  {
+   "kind": "cough",
+   "label": "cough_A",
+   "spot": "A",
+   "truth": [
+    1.09,
+    0.51
+   ],
+   "prep_s": 69.0,
+   "start_s": 73.0,
+   "end_s": 85.0,
+   "prompt": "spot A: cough 3 times, pausing between"
+  },
+  {
+   "kind": "impact",
+   "label": "impact_B",
+   "spot": "B",
+   "truth": [
+    1.73,
+    0.79
+   ],
+   "prep_s": 85.0,
+   "start_s": 89.0,
+   "end_s": 101.0,
+   "prompt": "spot B: drop a book flat on the floor 3 times (a slam, not a knock)"
+  }
+ ],
+ "total_s": 104.0
+}
