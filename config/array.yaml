@@ -1,0 +1,54 @@
+# Drop-and-Listen array configuration.
+# All units SI: meters, seconds, Hz, m/s. Positions are in the local frame (see geo).
+# Mode is automatic: 2 sensors -> bearing (direction) mode, 3+ -> position mode.
+
+medium: air            # air | water  (water needs hydrophones; not on hand)
+environment: disaster  # disaster | forest | underwater
+
+# Used by speed_of_sound.py. Update temperature/humidity from the Grove sensor (M5).
+conditions:
+  temperature_c: 20.0
+  humidity_pct: 50.0
+  salinity_ppt: 35.0   # water only
+  depth_m: 1.0         # water only
+
+sampling:
+  fs_hz: 10000         # per channel. TODO(hardware): confirm what the S2 sustains
+  adc_bits: 13         # TODO(hardware): ESP32-S2 ADC is 13-bit; confirm in firmware
+
+# One entry per sound sensor. Measure x_m / y_m with a tape and update.
+# pin values are placeholders. TODO(hardware): check against the board pinout (ADC1 only).
+sensors:
+  - {ch: 0, name: DNL-S1, x_m: -0.25, y_m: 0.0, pin: 1}
+  - {ch: 1, name: DNL-S2, x_m: 0.25, y_m: 0.0, pin: 2}
+  # Third sensor for position mode (2 m triangle), when it arrives:
+  # - {ch: 2, name: DNL-S3, x_m: 0.0, y_m: 1.732, pin: 3}
+
+bearing:
+  # A 2-sensor pair can't tell front from back. Sounds are assumed to come from
+  # this side of the line ch0 -> ch1: "left" or "right" (looking from ch0 to ch1).
+  front: left
+
+timing:
+  # 1-sigma error of a single onset time, per channel, seconds.
+  # Used for uncertainty (bearing wedge, position ellipse).
+  sigma_s: 1.0e-4
+
+# Local meters -> latitude/longitude. Default origin: venue (BASE-X Boston).
+# Replace with a phone GPS reading at the team's table.
+geo:
+  lat0: 42.36030
+  lon0: -71.05880
+  x_axis_bearing_deg: 90.0   # compass bearing of +x (90 = x east, y north)
+
+classification:
+  labels: [knock_tap, voice, impact, other]
+  # Optional environment classes, add when the demo set works:
+  # labels: [knock_tap, voice, impact, other, nature, machinery, structure_creak]
+
+sim:
+  seed: 0
+  timing_noise_s: 1.0e-4     # per-channel onset jitter used by the simulator
+  noise_counts: 8.0          # background ADC noise, 1-sigma, counts
+  knock_interval_s: 2.0      # one simulated sound every this many seconds
+  source_radius_m: [1.0, 3.0]

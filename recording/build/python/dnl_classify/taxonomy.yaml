@@ -1,0 +1,60 @@
+# What a first responder needs from a sound, mapped from public dataset labels.
+# coarse class -> is it evidence of a person?
+classes:
+  knock_tap: {person: true}    # deliberate signalling: knocking, tapping, clapping
+  voice:     {person: true}    # speech, calling, screaming, crying, laughing
+  cough:     {person: true}    # cough, sneeze
+  breath:    {person: true}    # breathing, snoring (faint: the Grove sensor rarely hears it)
+  impact:    {person: false}   # glass, footsteps of rescuers, drops, fireworks, clicks
+  steady:    {person: false}   # engines, saws, helicopters, rain, wind, fire, water
+  alarm:     {person: false}   # sirens, alarms, horns, bells, ticking
+  other:     {person: false}   # animals and everything else
+
+# dataset label -> coarse class. Anything not listed -> other.
+esc50:
+  door_wood_knock: knock_tap
+  clapping: knock_tap
+  crying_baby: voice
+  laughing: voice
+  coughing: cough
+  sneezing: cough
+  breathing: breath
+  snoring: breath
+  glass_breaking: impact
+  footsteps: impact
+  can_opening: impact
+  mouse_click: impact
+  keyboard_typing: impact
+  fireworks: impact
+  water_drops: impact
+  engine: steady
+  chainsaw: steady
+  helicopter: steady
+  airplane: steady
+  vacuum_cleaner: steady
+  hand_saw: steady
+  washing_machine: steady
+  rain: steady
+  wind: steady
+  sea_waves: steady
+  crackling_fire: steady
+  pouring_water: steady
+  train: steady
+  thunderstorm: steady
+  toilet_flush: steady
+  siren: alarm
+  clock_alarm: alarm
+  church_bells: alarm
+  car_horn: alarm
+  clock_tick: alarm
+
+nonspeech7k:          # label column of the Nonspeech7k metadata
+  crying: voice
+  screaming: voice
+  laugh: voice
+  cough: cough
+  sneeze: cough
+  breath: breath
+  yawn: breath
+
+librispeech: voice    # read speech, stand-in for calling out (no public shouting set this small)

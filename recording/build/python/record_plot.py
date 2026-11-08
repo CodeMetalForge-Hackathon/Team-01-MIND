@@ -4,10 +4,10 @@ Record (one USB port per node; any order, the node ID comes from the data):
     python record_plot.py record --ports COM9 COM10 COM11 --seconds 20 --out data/run1.npz
 
 Analyse and plot a recording:
-    python record_plot.py plot data/run1.npz --pos 1=0,0 2=2.5,0 3=1.25,2
+    python record_plot.py plot data/run1.npz --layout data/layout.json     (or --pos 1=x,y 2=x,y 3=x,y)
 
 Both in one go:
-    python record_plot.py both --ports COM9 COM10 COM11 --seconds 20 --pos 1=0,0 2=2.5,0 3=1.25,2
+    python record_plot.py both --ports COM9 COM10 COM11 --seconds 20 --layout data/layout.json
 
 Per node it makes one figure with three panels:
   1. ADC vs time (ms), whole recording, detected knocks marked
@@ -559,6 +559,18 @@ def plot(data, results, c, t_start, pos, choose, outdir, show):
         plt.show()
 
 
+def load_positions(items, layout=None):
+    """Node positions from --pos, or from a layout file made by live.py calibration. No defaults."""
+    if layout:
+        import json
+        data = json.loads(Path(layout).read_text())
+        return {int(k): (float(v[0]), float(v[1])) for k, v in data["nodes"].items()}
+    if items:
+        return parse_pos(items)
+    raise SystemExit("Node positions are needed: --pos 1=x,y 2=x,y 3=x,y  or  --layout layout.json "
+                     "(live.py writes one after you tap each node).")
+
+
 def parse_pos(items):
     pos = {}
     for it in items or []:
@@ -585,8 +597,8 @@ def main():
             p.add_argument("--seconds", type=float, default=20)
             p.add_argument("--out", default="data/run.npz")
             p.add_argument("--settle", type=float, default=3.0)
-        p.add_argument("--pos", nargs="+", default=["1=0,0", "2=2.5,0", "3=1.25,2"],
-                       help="node positions in meters, e.g. 1=0,0 2=2.5,0 3=1.25,2")
+        p.add_argument("--pos", nargs="+", help="node positions in meters, e.g. 1=x,y 2=x,y 3=x,y (no default)")
+        p.add_argument("--layout", help="layout.json written by live.py calibration (instead of --pos)")
         p.add_argument("--temp", type=float, default=20.0, help="air temperature, C")
         p.add_argument("--detector", choices=["level", "sharp"], default="level",
                        help="sharp: sudden jumps (best in noisy rooms); level: fixed threshold x noise floor")
@@ -605,7 +617,7 @@ def main():
         path = a.out
     else:
         path = a.path
-    pos = parse_pos(a.pos)
+    pos = load_positions(a.pos, a.layout)
     data, results, c, t_start = analyse(path, pos, a.temp, a.k, a.detector, a.ratio, not a.no_guided)
     plot(data, results, c, t_start, pos, a.sound, Path(path).with_suffix("") / "plots", not a.save_only)
 
