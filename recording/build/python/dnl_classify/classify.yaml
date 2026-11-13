@@ -11,6 +11,12 @@ rules:
   cough_max_dur_ms: 700
   steady_min_dur_ms: 1500
   steady_max_mod_hz: 1.5
+  # record_plot's knock / thud split (classify_sound). Sharp-onset sounds below this spectral
+  # centroid are thuds. Per node, because the sensors differ: on session1 knocks read
+  # mostly 200-1300 Hz (down to ~50 Hz) on node 1 (S2) and node 2 (C5), 850-2900 Hz on node 3 (S3).
+  # Not yet checked against a recording of real thuds: set from knocks only.
+  thud_max_centroid_hz: {1: 120, 2: 120, 3: 600, default: 200}
+  hit_max_rise_ms: 15         # short sounds (< cough_min_dur_ms) rising this fast count as knock/thud
 
 detection:
   k: 5.0            # trigger at k x noise floor

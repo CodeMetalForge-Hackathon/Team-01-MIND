@@ -50,7 +50,7 @@ def find_events(adc, fs, k=5.0, abs_min=15.0, refractory_s=0.12, end_frac=0.2):
     thr = np.maximum(k * floor, abs_min)
     above = env > thr
     events, i = [], int(0.3 * fs)                       # skip filter start-up
-    quiet_n, max_n = int(0.15 * fs), int(2.0 * fs)
+    quiet_n = int(0.15 * fs)
     while i < n:
         hits = np.flatnonzero(above[i:])
         if not len(hits):
@@ -60,24 +60,31 @@ def find_events(adc, fs, k=5.0, abs_min=15.0, refractory_s=0.12, end_frac=0.2):
         on = s
         while on > max(s - int(0.0064 * fs), 1) and env[on - 1] >= 0.3 * t0:
             on -= 1
-        seg = slow[s:min(s + max_n, n)]
-        # Firmware: loud = slow > 1.8 x floor. On nodes 1/2 room chatter keeps that true for
-        # seconds after a knock (measured on quiet_spot6/7), so here a sound also has to stay
-        # above end_frac of its own peak so far. Deliberate laptop-side deviation.
-        loud = seg > np.maximum(1.8 * f0, end_frac * np.maximum.accumulate(seg))
-        # end = last loud sample before the first 150 ms run of quiet
-        last = s
-        run = 0
-        for j, l in enumerate(loud):
-            if l:
-                last, run = s + j, 0
-            else:
-                run += 1
-                if run > quiet_n:
-                    break
+        last = event_end(slow, s, f0, fs, end_frac)
         events.append((on, max(last, s + 1), float(f0)))
         i = max(last, s) + int(refractory_s * fs) + quiet_n
     return events, env, slow
+
+
+def event_end(slow, s, floor, fs, end_frac=0.2):
+    """Last loud sample of the sound that starts at index s (ends after 150 ms of quiet, max 2 s).
+
+    Firmware: loud = slow > 1.8 x floor. On nodes 1/2 room chatter keeps that true for
+    seconds after a knock (measured on quiet_spot6/7), so here a sound also has to stay
+    above end_frac of its own peak so far. Deliberate laptop-side deviation.
+    """
+    quiet_n, max_n = int(0.15 * fs), int(2.0 * fs)
+    seg = slow[s:min(s + max_n, len(slow))]
+    loud = seg > np.maximum(1.8 * floor, end_frac * np.maximum.accumulate(seg))
+    last, run = s, 0
+    for j, l in enumerate(loud):
+        if l:
+            last, run = s + j, 0
+        else:
+            run += 1
+            if run > quiet_n:
+                break
+    return last
 
 
 def _count_peaks(slow_dec):

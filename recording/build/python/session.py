@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 
 import record_plot as rp
+import tdoa
 
 PREP_S = 4.0      # get-ready time before each block
 ACTIVE_S = 12.0   # how long each block lasts
@@ -94,13 +95,7 @@ def parse_spots(items):
 
 def valid_fix(sol, pos, margin=2.0):
     """Reject divergent or poorly conditioned fixes (positions far outside the nodes, big residual)."""
-    if not sol:
-        return False
-    xs = [p[0] for p in pos.values()]
-    ys = [p[1] for p in pos.values()]
-    if not (min(xs) - margin <= sol["x"] <= max(xs) + margin and min(ys) - margin <= sol["y"] <= max(ys) + margin):
-        return False
-    return sol["resid_m"] <= 0.05 and math.isfinite(sol["radius95"]) and sol["radius95"] <= 1.5
+    return tdoa.usable(sol, pos, margin)
 
 
 def block_for(rel, blocks):

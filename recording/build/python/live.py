@@ -1,22 +1,21 @@
 """Live mode: knock -> position on the map (and on ATAK) within about a second.
-No node positions, origin or compass direction are built in.
 
-FIELD WORKFLOW (nodes dropped anywhere, layout unknown):
-    python live.py --ports COM11 COM12 COM13
-  1. It asks you to tap each node (3 taps per node, directly on the sensor): the travel time of each tap to the
-     other nodes gives the distances between nodes, and from those it builds the layout.
-  2. It saves the layout to a file, then goes live: knock anywhere and it shows the position.
-  The map is relative: node 1 is the origin, node 2 sits on the +x axis, node 3 on the +y side.
+START (sensing and plotting begin immediately):
+    python live.py                      (or press Play in the editor)
+  Node positions and orientation come from live_setup.yaml next to this file: edit it once per deployment
+  (positions in metres, heading_deg = compass bearing of the +x axis). Ports are found automatically
+  unless you list them there. Everything can be overridden on the command line:
+    python live.py --ports COM11 COM12 COM13 --pos 1=0,0 2=2.5,0 3=1.4,1.8 --heading 90
+    python live.py --setup other_site.yaml
 
-REUSE A LAYOUT (nodes not moved):          python live.py --ports ... --layout-file data/layout.json
-  (if the file does not exist yet it is created by the tap calibration)
-MEASURED POSITIONS INSTEAD OF TAPS:         python live.py --ports ... --pos 1=x,y 2=x,y 3=x,y
-NO HARDWARE (replay a recording):           python live.py --replay data/run.npz --layout-file data/layout.json
+NO HARDWARE (replay a recording):           python live.py --replay data/run1.npz
+OTHER SAVED LAYOUT:                         python live.py --layout-file data/layout.json
+NO TAPE MEASURE (tap each node 3 times, the travel times give the layout):
+    python live.py --calibrate --layout-file data/layout.json
 
-ATAK (nothing is assumed about where the nodes are): give two GPS readings from the phone's own position,
-standing at node 1 and at node 2, and which side node 3 is on when you face node 2 from node 1:
-    python live.py --ports ... --atak --gps1 LAT,LON --gps2 LAT,LON --node3-side left
-  (or an explicit frame: --lat0 LAT --lon0 LON --bearing DEG, the compass bearing of the +x axis)
+ATAK: put the GPS of the frame origin in live_setup.yaml (origin: lat/lon; heading_deg is the orientation), then
+    python live.py --atak
+  (or from two phone GPS readings at node 1 and node 2: --atak --gps1 LAT,LON --gps2 LAT,LON --node3-side left)
   If markers don't show up: --atak-host <phone IP> --atak-port 4242
 
 What you see: orange dot = located knock; red star = LIKELY PERSON (2+ knocks in the same place within 6 s,
@@ -43,6 +42,7 @@ from pathlib import Path
 import numpy as np
 
 import record_plot as rp
+import tdoa
 
 WINDOW_S = 5.0       # seconds of signal analysed each cycle
 CYCLE_S = 0.25       # how often
@@ -52,18 +52,42 @@ M_PER_DEG_LAT = 111_320.0
 
 # ------------------------------------------------------------------ helpers
 def valid_fix(sol, pos, margin=2.0):
-    if not sol:
-        return False
-    xs = [p[0] for p in pos.values()]
-    ys = [p[1] for p in pos.values()]
-    if not (min(xs) - margin <= sol["x"] <= max(xs) + margin and min(ys) - margin <= sol["y"] <= max(ys) + margin):
-        return False
-    return sol["resid_m"] <= 0.05 and math.isfinite(sol["radius95"]) and sol["radius95"] <= 1.5
+    return tdoa.usable(sol, pos, margin)
 
 
 def gps_pair(text):
     lat, lon = (float(v) for v in text.split(","))
     return lat, lon
+
+
+SETUP_DEFAULT = Path(__file__).with_name("live_setup.yaml")
+BOARD_VIDS = {0x303A: "Espressif", 0x239A: "Adafruit"}      # the nodes' USB vendor IDs
+
+
+def load_setup(path):
+    """live_setup.yaml -> dict(ports, pos, heading, lat0, lon0, temp). Missing file -> empty dict."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    import yaml
+    cfg = yaml.safe_load(p.read_text()) or {}
+    origin = cfg.get("origin") or {}
+    return dict(ports=list(cfg.get("ports") or []),
+                pos={int(k): (float(v[0]), float(v[1])) for k, v in (cfg.get("nodes") or {}).items()},
+                heading=cfg.get("heading_deg"), lat0=origin.get("lat"), lon0=origin.get("lon"),
+                temp=cfg.get("temp_c"))
+
+
+def find_ports():
+    """USB serial ports that belong to ESP32 boards (Espressif / Adafruit vendor IDs)."""
+    from serial.tools import list_ports
+    return sorted(p.device for p in list_ports.comports() if p.vid in BOARD_VIDS)
+
+
+def north_local(heading_deg):
+    """Unit vector pointing north, in the local frame whose +x axis has compass bearing heading_deg."""
+    b = math.radians(heading_deg)
+    return math.cos(b), math.sin(b)
 
 
 class Atak:
@@ -81,8 +105,8 @@ class Atak:
         self.sock = None
         if self.on:
             if not ((self.gps1 and self.gps2) or (a.lat0 is not None and a.lon0 is not None and a.bearing is not None)):
-                raise SystemExit("--atak needs to know where the nodes are: give --gps1 LAT,LON --gps2 LAT,LON "
-                                 "(phone GPS standing at node 1 and node 2), or --lat0 --lon0 --bearing.")
+                raise SystemExit("--atak needs to know where the nodes are: set origin: lat/lon and heading_deg in "
+                                 "live_setup.yaml, or give --gps1 LAT,LON --gps2 LAT,LON (phone GPS at node 1 and 2).")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
@@ -390,7 +414,7 @@ class Processor:
         for g in sorted(groups, key=lambda g: min(e["onset_us"] for e in g.values())):
             anchor = min(e["onset_us"] for e in g.values())
             if lo < anchor <= boundary:
-                self.handle_calibration(g) if self.cal else self.handle(g)
+                self.handle_calibration(g) if self.cal else self.handle(g, data)
 
     # ---------------------------------------------------------- calibration
     def handle_calibration(self, g):
@@ -438,7 +462,7 @@ class Processor:
         self.cal = None
 
     # ---------------------------------------------------------- localisation
-    def handle(self, g):
+    def handle(self, g, data):
         ids = sorted(g)
         t_data = min(e["onset_us"] for e in g.values()) / 1e6      # data time: same behaviour at any replay speed
         if min(e["snr"] for e in g.values()) < self.a.min_snr:
@@ -446,7 +470,10 @@ class Processor:
         if len(ids) < 3:
             self.n_two += 1
             return
-        sol = rp.triangulate([self.pos[n] for n in ids], [g[n]["onset_us"] / 1e6 for n in ids], self.c)
+        # arrival times from GCC-PHAT between the nodes' envelopes (sub-sample), not threshold crossings
+        times, _ = tdoa.refine_times(g, {n: (data[n]["t"], data[n]["env"]) for n in ids}, self.pos, self.c)
+        T = [times[n] for n in ids]
+        sol = rp.triangulate([self.pos[n] for n in ids], T, self.c)
         if not valid_fix(sol, self.pos):
             self.n_rejected += 1
             return
@@ -470,11 +497,13 @@ class Processor:
             cl["level"], cl["pos"] = level, (mx, my)
             self.n_fix += 1
             fx = dict(id=self.n_fix, wall=now, x=sol["x"], y=sol["y"], radius=sol["radius95"],
-                      nodes=ids, cluster=cl["id"], level=level, guided=any(e.get("guided") for e in g.values()))
+                      nodes=ids, cluster=cl["id"], level=level, guided=any(e.get("guided") for e in g.values()),
+                      sol=sol, times=T)
             self.fixes.append(fx)
             line = (f"[{now - self.t0:6.1f}s] FIX #{fx['id']:<3} ({sol['x']:5.2f}, {sol['y']:5.2f}) "
-                    f"±{sol['radius95']:.2f} m  {level.upper()}" + (f"  (cluster {cl['id']}, {len(cl['fixes'])} knocks)"
-                                                                    if level == "likely_person" else ""))
+                    f"±{sol['radius95']:.2f} m  GDOP {sol['gdop']:.1f}  {level.upper()}"
+                    + ("  AMBIGUOUS" if sol["ambiguous"] else "")
+                    + (f"  (cluster {cl['id']}, {len(cl['fixes'])} knocks)" if level == "likely_person" else ""))
             self.log.appendleft(f"#{fx['id']:<3}({sol['x']:.2f},{sol['y']:.2f}) "
                                 + (f"PERSON x{len(cl['fixes'])}" if level == "likely_person" else "knock"))
         sent = ""
@@ -495,10 +524,55 @@ class Dashboard:
             matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         self.plt, self.proc, self.buf = plt, proc, buf
-        self.fig = plt.figure(figsize=(13, 7))
-        gs = self.fig.add_gridspec(1, 2, width_ratios=[1.7, 1])
+        self.fig = plt.figure(figsize=(13, 8.5))
+        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.7, 1], height_ratios=[3.2, 1])
         self.ax = self.fig.add_subplot(gs[0, 0])
         self.tx = self.fig.add_subplot(gs[0, 1])
+        self.sig = self.fig.add_subplot(gs[1, :])        # live signal of every node: shows it is sensing
+
+    def draw_signals(self):
+        """Last few seconds of each node's sound, one strip per node (loudness above its resting level)."""
+        ax, proc = self.sig, self.proc
+        ax.clear()
+        status = self.buf.status()
+        t_end = None
+        strips = []
+        for n in proc.nodes:
+            t, adc, fs = self.buf.window(n)
+            if t is None or len(t) < 20:
+                strips.append((n, None, None))
+                continue
+            step = max(1, int(fs / 1000))                     # ~1 kHz is plenty to draw
+            k = len(adc) // step * step
+            lvl = np.abs(adc[:k] - np.median(adc)).reshape(-1, step).max(axis=1)
+            strips.append((n, t[:k:step], lvl))
+            t_end = t[-1] if t_end is None else max(t_end, t[-1])
+        for row, (n, t, lvl) in enumerate(strips):
+            base = len(strips) - 1 - row
+            col = "#2ca02c" if status.get(n, {}).get("online") else "#777777"
+            if t is None:
+                ax.text(-WINDOW_S + 0.05, base + 0.4, f"node {n}: no data yet", fontsize=8, color="#777777")
+                continue
+            ax.fill_between((t - t_end) / 1e6, base, base + 0.9 * np.clip(lvl / (np.percentile(lvl, 99.5) + 1e-9), 0, 1),
+                            color=col, lw=0, alpha=0.8)
+        ax.set_xlim(-WINDOW_S, 0)
+        ax.set_ylim(-0.1, len(strips))
+        ax.set_yticks([len(strips) - 1 - i + 0.45 for i in range(len(strips))])
+        ax.set_yticklabels([f"node {n}" for n, _, _ in strips])
+        ax.set_xlabel("seconds before now")
+        ax.set_title("Live signal (each strip scaled to its own loudest sound; grey = node offline)", fontsize=9)
+        ax.grid(alpha=0.3, axis="x")
+
+    def draw_north(self, ax, heading):
+        """North arrow in the lower-right corner of the map (heading = compass bearing of the +x axis)."""
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        L = 0.09 * max(x1 - x0, y1 - y0)
+        cx, cy = x1 - 1.4 * L, y0 + 1.4 * L
+        ux, uy = north_local(heading)
+        ax.annotate("", xy=(cx + L * ux, cy + L * uy), xytext=(cx - 0.4 * L * ux, cy - 0.4 * L * uy),
+                    arrowprops=dict(arrowstyle="-|>", color="k", lw=1.8))
+        ax.text(cx + 1.35 * L * ux, cy + 1.35 * L * uy, "N", ha="center", va="center", fontsize=12, weight="bold")
 
     def draw(self):
         ax, tx, proc = self.ax, self.tx, self.proc
@@ -515,13 +589,32 @@ class Dashboard:
         for n, s in status.items():
             lines.append(f" node {n}: {'online' if s['online'] else 'OFFLINE'}  {s['pps']:.0f} pkt/s")
         if pos:
+            # layout: GDOP shading (where the nodes can locate well) + node triangle; cached per layout
+            key = tuple(sorted(pos.items()))
+            if getattr(self, "_layout_key", None) != key:
+                self._layout_key = key
+                self._X, self._Y = tdoa.map_grid(pos, pad=1.0, n=120)
+                self._G = tdoa.gdop_map([pos[n] for n in sorted(pos)], self._X, self._Y)
+            ax.contourf(self._X, self._Y, np.clip(self._G, 0, 8), levels=[0, 1.5, 2, 3, 5, 8], cmap="Greys", alpha=0.22)
+            tdoa.draw_layout(ax, pos, with_gdop=False, labels=False)
             for n, (x, y) in pos.items():
-                ax.plot(x, y, "s", ms=14, color="#2ca02c" if status.get(n, {}).get("online") else "#777777")
+                ax.plot(x, y, "s", ms=14, color="#2ca02c" if status.get(n, {}).get("online") else "#777777", zorder=6)
                 ax.annotate(f"node {n}", (x, y), textcoords="offset points", xytext=(0, -20), ha="center", fontsize=10)
             for f in fixes:
                 age = now - f["wall"]
                 if age < 90:
                     ax.plot(f["x"], f["y"], "o", ms=7, color="#ff7f0e", alpha=max(0.25, 1 - age / 90))
+            latest = fixes[-1] if fixes and now - fixes[-1]["wall"] < 20 else None
+            if latest:                                   # how the newest fix was found: hyperbolas + 95 % ellipse
+                P = [pos[n] for n in latest["nodes"]]
+                for k, (_, _, F) in enumerate(tdoa.hyperbolas(P, latest["times"], proc.c, self._X, self._Y)):
+                    ax.contour(self._X, self._Y, F, levels=[0], colors="#1f77b4",
+                               linestyles=["-", "--", ":"][k % 3], linewidths=1.0, alpha=0.8)
+                el = tdoa.ellipse_xy(latest["sol"])
+                if el is not None:
+                    ax.fill(*el, color="#ff7f0e", alpha=0.18, lw=0)
+                if latest["sol"].get("ambiguous"):
+                    ax.plot(*latest["sol"]["alt"], "x", ms=10, color="#ff7f0e", mew=2)
             for c in clusters:
                 if c["level"] == "likely_person" and now - c["last_wall"] < 90:
                     a = max(0.4, 1 - (now - c["last_wall"]) / 90)
@@ -532,8 +625,10 @@ class Dashboard:
             ys = [p[1] for p in pos.values()]
             ax.set_xlim(min(xs) - 1.0, max(xs) + 1.0)
             ax.set_ylim(min(ys) - 0.8, max(ys) + 1.0)
-            ax.set_title("Drop-and-Listen live   orange: located knock   red star: likely person\n"
-                         "(relative map: node 1 = origin, node 2 on +x)", fontsize=10)
+            if proc.a.heading is not None:
+                self.draw_north(ax, proc.a.heading)
+            ax.set_title("Drop-and-Listen live   orange: located knock (shaded = 95% area)   red star: likely person\n"
+                         "blue lines: hyperbolas of the newest knock   grey: GDOP, darker = less accurate", fontsize=10)
             ax.set_xlabel("x (m)")
             ax.set_ylabel("y (m)")
         else:
@@ -551,6 +646,7 @@ class Dashboard:
         lines += ["", f"fixes {proc.n_fix}  2-node only {proc.n_two}  rejected {proc.n_rejected}", "", "LATEST"]
         lines += [" " + x[:42] for x in log[:12]]
         tx.text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=10)
+        self.draw_signals()
 
     def run(self, stop):
         from matplotlib.animation import FuncAnimation
@@ -563,16 +659,20 @@ class Dashboard:
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ports", nargs="+")
+    ap.add_argument("--setup", default=str(SETUP_DEFAULT),
+                    help="ports, node positions and orientation (default: live_setup.yaml next to live.py)")
+    ap.add_argument("--ports", nargs="+", help="override the setup's ports (default: found automatically)")
     ap.add_argument("--replay")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed")
-    ap.add_argument("--pos", nargs="+", help="measured node positions (optional), e.g. 1=x,y 2=x,y 3=x,y")
-    ap.add_argument("--layout-file", help="load this layout if it exists; otherwise calibrate by tapping and save here")
+    ap.add_argument("--pos", nargs="+", help="override the setup's node positions, e.g. 1=x,y 2=x,y 3=x,y")
+    ap.add_argument("--heading", type=float, help="override the setup's heading: compass bearing of +x, degrees")
+    ap.add_argument("--calibrate", action="store_true", help="ignore known positions and measure them by tapping")
+    ap.add_argument("--layout-file", help="use this saved layout (from --calibrate) instead of the setup's positions")
     ap.add_argument("--nodes", type=int, nargs="+", default=[1, 2, 3], help="node IDs in the system")
     ap.add_argument("--taps", type=int, default=3, help="calibration taps per node")
     ap.add_argument("--max-spacing", type=float, default=10.0, help="largest possible distance between nodes (m)")
     ap.add_argument("--tape", nargs="+", help="true distances to compare the calibration with, e.g. 12=2.5 13=2.3 23=2.1")
-    ap.add_argument("--temp", type=float, default=20.0)
+    ap.add_argument("--temp", type=float, default=None, help="air temperature, C (default: setup, else 20)")
     ap.add_argument("--k", type=float, default=5.0)
     ap.add_argument("--min-snr", type=float, default=3.0)
     ap.add_argument("--same-place", type=float, default=0.8, help="m: knocks this close count as the same place")
@@ -591,17 +691,49 @@ def main():
     ap.add_argument("--lon0", type=float)
     ap.add_argument("--bearing", type=float, help="explicit frame: compass bearing of the +x axis, degrees")
     a = ap.parse_args()
-    if not a.ports and not a.replay:
-        raise SystemExit("Give --ports COM11 COM12 COM13, or --replay a recording.")
+
+    # ---- setup: live_setup.yaml, overridden by anything given on the command line
+    setup = load_setup(a.setup)
+    if setup:
+        print(f"Setup: {a.setup}")
+    elif Path(a.setup) != SETUP_DEFAULT:
+        raise SystemExit(f"Setup file {a.setup} not found.")
+    if a.temp is None:
+        a.temp = float(setup.get("temp") or 20.0)
+    heading = a.heading if a.heading is not None else setup.get("heading")
+    a.heading = heading
+    # ATAK frame from the setup: origin GPS + heading (unless --gps1/--gps2 or --lat0/--lon0/--bearing given)
+    lat0 = a.lat0 if a.lat0 is not None else setup.get("lat0")
+    lon0 = a.lon0 if a.lon0 is not None else setup.get("lon0")
+    if lat0 is not None and lon0 is not None and not (a.gps1 and a.gps2):
+        a.lat0, a.lon0 = float(lat0), float(lon0)
+        if a.bearing is None:
+            a.bearing = float(heading or 0.0)
+    if not a.replay and not a.ports:
+        a.ports = setup.get("ports") or find_ports()
+        if not a.ports:
+            raise SystemExit("No node boards found on USB. Plug them in, list them under ports: in "
+                             f"{a.setup}, or give --ports COM11 COM12 COM13 (or --replay a recording).")
 
     layout_path = a.layout_file or f"data/layout_{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     pos = None
-    if a.pos:
+    if a.calibrate:
+        print("Calibration requested: positions will be measured by tapping each node.")
+    elif a.pos:
         pos = rp.parse_pos(a.pos)
-        print("Using the node positions you gave with --pos.")
-    elif a.layout_file and Path(a.layout_file).exists():
+        print("Node positions from --pos.")
+    elif a.layout_file:
         pos = rp.load_positions(None, a.layout_file)
-        print(f"Loaded layout from {a.layout_file}.")
+        print(f"Node positions from {a.layout_file}.")
+    elif setup.get("pos"):
+        pos = setup["pos"]
+        print(f"Node positions from {a.setup}.")
+    else:
+        raise SystemExit(f"No node positions: fill in nodes: in {a.setup}, give --pos 1=x,y 2=x,y 3=x,y, "
+                         "or measure them by tapping with --calibrate.")
+    if pos:
+        print("  " + "   ".join(f"node {n} ({x:.2f}, {y:.2f}) m" for n, (x, y) in sorted(pos.items()))
+              + (f"   heading of +x: {heading:.0f} deg" if heading is not None else "   heading: not set"))
     nodes = sorted(pos) if pos else sorted(a.nodes)
     if len(nodes) < 3:
         raise SystemExit("Need at least 3 nodes.")
